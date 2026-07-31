@@ -63,8 +63,12 @@ jobs:
       - name: Clippy — the 0-warning lint wall
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `--test-threads=1`: several alloc/codegen gates measure allocations via a
+      # PROCESS-GLOBAL counting allocator, so concurrent tests' allocations would
+      # bleed into the count (a flaky "got N" on a zero-alloc assertion). Serial
+      # execution isolates the counter — the deterministic way to run these gates.
       - name: Tests (offline / non-ignored)
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
 
       - name: Doctests
         run: cargo test --workspace --doc
@@ -106,30 +110,31 @@ jobs:
       - name: Install PostgreSQL ${{ matrix.pg }} (PGDG) + openssl
         run: |
           set -euxo pipefail
-          # PGDG apt repo carries every supported major.
-          sudo install -d /usr/share/postgresql-common/pgdg
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg
-          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
-          # Remove the runner's pre-installed PostgreSQL so ours owns port 5432.
-          sudo apt-get -y remove --purge 'postgresql-1*' 'postgresql-common' || true
-          sudo apt-get install -y postgresql-${{ matrix.pg }} openssl
+          # postgresql-common ships pg_createcluster/pg_lsclusters AND the official
+          # PGDG repo installer; run the installer (robustly adds the repo + key)
+          # then install the exact major. Keep postgresql-common (the cluster tools).
+          sudo apt-get install -y postgresql-common openssl
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y "postgresql-${{ matrix.pg }}"
 
       - name: Configure the cluster to match the tests' local prerequisites
         run: |
           set -euxo pipefail
           PG=${{ matrix.pg }}
+          # Our target major must own 5432 — drop EVERY existing cluster first
+          # (the runner ships a pre-installed PostgreSQL holding 5432).
+          sudo pg_lsclusters -h | awk '{print $1, $2}' | while read -r v n; do
+            sudo pg_dropcluster --stop "$v" "$n" || true
+          done
           # Fresh cluster on 5432 with local+host TRUST (the suites' default auth),
           # a unix socket at /tmp (the "/tmp"-host suites), and a plaintext server
           # (the TLS suites bring their own ephemeral SSL cluster).
-          sudo pg_dropcluster --stop "$PG" main || true
           sudo pg_createcluster --start "$PG" main -p 5432 -- \
             --auth-local=trust --auth-host=trust
           CONF=/etc/postgresql/$PG/main
-          echo "unix_socket_directories = '/tmp,/var/run/postgresql'" | sudo tee -a "$CONF/conf.d/bsql.conf"
-          echo "password_encryption = 'scram-sha-256'"                | sudo tee -a "$CONF/conf.d/bsql.conf"
+          echo "unix_socket_directories = '/tmp,/var/run/postgresql'" | sudo tee -a "$CONF/postgresql.conf"
+          echo "password_encryption = 'scram-sha-256'"                | sudo tee -a "$CONF/postgresql.conf"
           # SCRAM login role for the channel-binding / SCRAM suites (host + hostssl).
           printf 'host    all    bsql_test_scram    127.0.0.1/32    scram-sha-256\n'   | sudo tee -a "$CONF/pg_hba.conf"
           printf 'host    all    bsql_test_scram    ::1/128         scram-sha-256\n'   | sudo tee -a "$CONF/pg_hba.conf"
