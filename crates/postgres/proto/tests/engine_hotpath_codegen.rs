@@ -355,17 +355,32 @@ fn next_event_is_panic_free_and_within_the_instruction_ceiling() {
     }
 
     // ---- Property 2: instruction-count ceiling. ----
-    let measured = instruction_count(&body);
-    let ceiling = resolve_ceiling(measured);
-    assert!(
-        measured <= ceiling,
-        "ActiveEngine::next_event compiled to {measured} instructions, over the \
-         ceiling of {ceiling}. The inbound hot dispatch grew (bloat, a cold \
-         helper newly inlined into the hot frame, or a slipped-in branch). If \
-         this growth is intended and reviewed, regenerate the ceiling with \
-         BSQL_HOTPATH_PIN=overwrite cargo test -p bsql-postgres-proto --test \
-         engine_hotpath_codegen (the new number lands as a golden diff)."
-    );
+    // ARCH-GATED. The committed ceiling golden is a RAW instruction count, which
+    // is ISA-specific — it was measured on the pinned aarch64 dev host, so on any
+    // other host arch (e.g. an x86_64 CI runner) it is meaningless and would fire
+    // a false positive. Skip it there (NO-OP-PASS, mirroring the cross_platform
+    // gate's absent-target skip); Properties 1 (panic-freedom) and 3 (outlined
+    // cold helpers) below are arch-INDEPENDENT and still run on every host. The
+    // ceiling is enforced on the aarch64 dev host (and any aarch64 CI runner).
+    if cfg!(target_arch = "aarch64") {
+        let measured = instruction_count(&body);
+        let ceiling = resolve_ceiling(measured);
+        assert!(
+            measured <= ceiling,
+            "ActiveEngine::next_event compiled to {measured} instructions, over the \
+             ceiling of {ceiling}. The inbound hot dispatch grew (bloat, a cold \
+             helper newly inlined into the hot frame, or a slipped-in branch). If \
+             this growth is intended and reviewed, regenerate the ceiling with \
+             BSQL_HOTPATH_PIN=overwrite cargo test -p bsql-postgres-proto --test \
+             engine_hotpath_codegen (the new number lands as a golden diff)."
+        );
+    } else {
+        eprintln!(
+            "engine_hotpath_codegen: instruction-count ceiling SKIPPED on this \
+             host arch (golden pinned for aarch64); panic-freedom + cold-helper \
+             outlining still enforced."
+        );
+    }
 
     // ---- Property 3: the cold helpers stay OUTLINED. ----
     //

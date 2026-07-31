@@ -135,6 +135,13 @@ jobs:
           CONF=/etc/postgresql/$PG/main
           echo "unix_socket_directories = '/tmp,/var/run/postgresql'" | sudo tee -a "$CONF/postgresql.conf"
           echo "password_encryption = 'scram-sha-256'"                | sudo tee -a "$CONF/postgresql.conf"
+          # Debian's PostgreSQL package enables ssl with a self-signed snakeoil cert
+          # by default; the suites connect to localhost (default SslMode::Prefer),
+          # which would then negotiate TLS and correctly REJECT the untrusted cert.
+          # The local dev prerequisite is a plaintext server, so match it: ssl=off.
+          # (The TLS-specific suites — channel_binding_plus / tls_fragmentation —
+          # stand up their OWN ephemeral SSL clusters, so they are unaffected.)
+          echo "ssl = off"                                            | sudo tee -a "$CONF/postgresql.conf"
           # SCRAM login role for the channel-binding / SCRAM suites (host + hostssl).
           printf 'host    all    bsql_test_scram    127.0.0.1/32    scram-sha-256\n'   | sudo tee -a "$CONF/pg_hba.conf"
           printf 'host    all    bsql_test_scram    ::1/128         scram-sha-256\n'   | sudo tee -a "$CONF/pg_hba.conf"
@@ -146,6 +153,10 @@ jobs:
           # Smoke the socket + TCP the suites use.
           psql -h /tmp -U "smir-ant" -d postgres -c 'SELECT version();'
           psql -h 127.0.0.1 -U "smir-ant" -d postgres -c 'SELECT 1;'
+          # Put this major's binaries (initdb / pg_ctl / postgres) on PATH for the
+          # TLS/SCRAM/MD5 suites that stand up their OWN ephemeral clusters — Debian
+          # keeps them in /usr/lib/postgresql/<major>/bin, not on the default PATH.
+          echo "/usr/lib/postgresql/${{ matrix.pg }}/bin" >> "$GITHUB_PATH"
 
       - name: Show toolchain
         run: rustup show
