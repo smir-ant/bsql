@@ -520,11 +520,11 @@ async fn migration_long_op_is_not_client_cut() {
         .expect("monitor connect");
     mon.execute_raw(&format!("CREATE SCHEMA {schema}")).await.expect("create schema");
 
-    let config = healthy_config(Duration::from_millis(300), 2).with_search_path(&schema);
+    let config = healthy_config(Duration::from_millis(1500), 1).with_search_path(&schema);
     let mut conn = Connection::connect(&config).await.expect("connect");
-    // The migration disables its own budget then sleeps 3 s — far past the 2.3 s
-    // connect-time window; suppression must let it complete.
-    let migs = [("0001_slow", "SET LOCAL statement_timeout = 0;\nSELECT pg_sleep(3);")];
+    // The migration disables its own budget then sleeps 3.5 s — past the 2.5 s
+    // connect-time window (1.5 s statement + 1 s connect); suppression must let it complete.
+    let migs = [("0001_slow", "SET LOCAL statement_timeout = 0;\nSELECT pg_sleep(3.5);")];
     let start = Instant::now();
     let report = conn
         .run_migrations(MigrationSource::embedded(&migs))
@@ -533,8 +533,8 @@ async fn migration_long_op_is_not_client_cut() {
     let elapsed = start.elapsed();
     assert_eq!(report.applied.len(), 1);
     assert!(
-        elapsed >= Duration::from_secs(3),
-        "the migration must have run its full 3 s sleep, took {elapsed:?}",
+        elapsed >= Duration::from_millis(3500),
+        "the migration must have run its full 3.5 s sleep, took {elapsed:?}",
     );
 
     // After the run, the steady window is restored — a normal query still works.
