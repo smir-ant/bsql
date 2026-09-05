@@ -464,6 +464,7 @@ fn emit_user_composite(
     let mut field_type_tokens = Vec::with_capacity(fields.len());
     let mut field_docs = Vec::with_capacity(fields.len());
     let mut decode_exprs = Vec::with_capacity(fields.len());
+    let mut field_oids = Vec::with_capacity(fields.len());
     for (field, &ty) in fields.iter().zip(field_types.iter()) {
         field_idents.push(make_field_ident(&field.name, span)?);
         // Every composite field is nullable on the wire, so the Rust field is
@@ -481,6 +482,11 @@ fn emit_user_composite(
             &no_bridges,
             &field_idents_resolver,
         )?);
+        let expected_oid = match ty {
+            bsql_build::RustType::UserEnum(_) | bsql_build::RustType::UserComposite(_) => 0u32,
+            _ => col_spec(ty).oid_value,
+        };
+        field_oids.push(expected_oid);
         field_docs.push(format!(
             "The `{}` attribute of the `{composite_name}` composite (always \
              `Option` — a composite attribute is nullable on the wire).",
@@ -533,8 +539,9 @@ fn emit_user_composite(
             ) -> ::core::result::Result<Self, ::bsql::__rt::DecodeError> {
                 let mut #reader = ::bsql::__rt::CompositeReader::new(#frame, #nfields)?;
                 #(
-                    let #field_idents = match ::bsql::__rt::CompositeReader::next_field(
+                    let #field_idents = match ::bsql::__rt::CompositeReader::next_field_with_oid(
                         &mut #reader,
+                        #field_oids,
                     )? {
                         ::core::option::Option::Some(__bytes) =>
                             ::core::option::Option::Some(#decode_exprs),

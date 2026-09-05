@@ -1,6 +1,6 @@
 //! Row-schema + row-body decoding primitives.
 //!
-//! `bsql-pg-proto` owns the raw wire encoding of a result-set: the
+//! `bsql-postgres-proto` owns the raw wire encoding of a result-set: the
 //! `RowDescription` frame tells us column count, type OIDs, and
 //! per-column format codes; each `DataRow` frame carries the column
 //! values. This module parses `RowDescription` into [`RowDesc`] (the
@@ -481,6 +481,74 @@ pub fn parse_column_names(
     Ok(names)
 }
 
+/// Extract both column type OIDs and column names from a `RowDescription` payload in a SINGLE linear pass.
+///
+/// Combines [`parse_row_description`] and [`parse_column_names`] into one unified pass, avoiding
+/// scanning the wire payload twice and eliminating redundant intermediary allocations.
+#[cold]
+pub fn parse_row_desc_and_names(
+    payload: &[u8],
+) -> Result<(alloc::vec::Vec<u32>, alloc::vec::Vec<alloc::string::String>), crate::error::ProtocolError> {
+    use crate::error::ProtocolError;
+    let malformed = || ProtocolError::MalformedRowDescription {
+        payload_len: payload.len(),
+    };
+
+    let (count_bytes, mut rest) = payload.split_first_chunk::<2>().ok_or_else(malformed)?;
+    let n_columns_i16 = i16::from_be_bytes(*count_bytes);
+    if n_columns_i16 < 0 {
+        return Err(malformed());
+    }
+    let n_columns = u16::try_from(n_columns_i16).map_err(|_| malformed())?;
+    let n_columns_usize = usize::from(n_columns);
+
+    if n_columns_usize > MAX_ROW_COLUMNS {
+        return Err(ProtocolError::TooManyColumns {
+            count: n_columns_usize,
+            max: MAX_ROW_COLUMNS,
+        });
+    }
+
+    let mut oids = alloc::vec::Vec::with_capacity(n_columns_usize);
+    let mut names = alloc::vec::Vec::with_capacity(n_columns_usize);
+
+    for _idx in 0..n_columns_usize {
+        let nul_pos = rest.iter().position(|&b| b == 0).ok_or_else(malformed)?;
+        let name_bytes = rest.get(..nul_pos).ok_or_else(malformed)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| malformed())?;
+        names.push(alloc::string::String::from(name));
+
+        let name_end = nul_pos.saturating_add(1);
+        let after_name = rest.get(name_end..).ok_or_else(malformed)?;
+
+        let (meta, next_cursor) = after_name
+            .split_first_chunk::<18>()
+            .ok_or_else(malformed)?;
+
+        let &[
+            _tbl0, _tbl1, _tbl2, _tbl3,
+            _att0, _att1,
+            toid0, toid1, toid2, toid3,
+            _ts0, _ts1,
+            _tm0, _tm1, _tm2, _tm3,
+            fc0, fc1,
+        ] = meta;
+        let type_oid = u32::from_be_bytes([toid0, toid1, toid2, toid3]);
+        let format_code_i16 = i16::from_be_bytes([fc0, fc1]);
+        let _format_code = FormatCode::try_from_wire_i16(format_code_i16)
+            .map_err(|code| ProtocolError::UnexpectedFormatCode { code })?;
+
+        oids.push(type_oid);
+        rest = next_cursor;
+    }
+
+    if !rest.is_empty() {
+        return Err(malformed());
+    }
+
+    Ok((oids, names))
+}
+
 /// Extract the parameter-type OIDs from a `ParameterDescription` (`'t'`) payload.
 ///
 /// Wire body shape (PG §55.7): `n_params: int16` followed by `n_params × int32`
@@ -946,6 +1014,16 @@ pub enum DecodeError {
         /// The OID the server's `RowDescription` reported at runtime.
         found: u32,
     },
+    /// A user-defined COMPOSITE (row-type) column's field type OID does not match
+    /// the field type expected by the generated composite struct.
+    CompositeFieldOidMismatch {
+        /// The zero-based composite field index where the mismatch occurred.
+        index: u16,
+        /// The field OID the generated type expects.
+        expected: u32,
+        /// The field OID found in the composite wire frame.
+        found: u32,
+    },
 }
 
 // Direct size pin. The two widest variants are `TruncatedColumnData { column_idx:
@@ -1050,6 +1128,11 @@ impl fmt::Display for DecodeError {
                  (the migration schema), but the server reported OID {found} at runtime — the live \
                  column type differs from the migration (an out-of-band ALTER COLUMN TYPE, or a \
                  TEMP TABLE shadowing the migration table)",
+            ),
+            Self::CompositeFieldOidMismatch { index, expected, found } => write!(
+                f,
+                "composite column field {index} type OID mismatch: expected OID {expected}, \
+                 found OID {found} in wire frame (the live composite field was altered or retyped)",
             ),
         }
     }
@@ -2199,8 +2282,16 @@ impl<'a> Cell<'a, TextFmt> for &'a str {
     /// collapsed to `DecodeError::NonUtf8` here.
     #[inline]
     fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
-        simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
+        decode_utf8_fast(bytes)
     }
+}
+
+#[inline]
+pub(crate) fn decode_utf8_fast(bytes: &[u8]) -> Result<&str, DecodeError> {
+    if bytes.len() <= 16 && validate_utf8_swar(bytes).is_some() {
+        return core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8);
+    }
+    simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -2323,7 +2414,7 @@ impl<'a> Cell<'a, BinaryFmt> for &'a str {
     const OID: u32 = oids::TEXT;
     #[inline]
     fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
-        simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
+        decode_utf8_fast(bytes)
     }
 }
 
@@ -3234,6 +3325,8 @@ pub struct CompositeReader<'a> {
     /// The unconsumed remainder of the frame (after the count header and every
     /// field read so far).
     rest: &'a [u8],
+    /// The current 0-based field index, tracked for mismatch diagnostics.
+    field_idx: u16,
 }
 
 impl<'a> CompositeReader<'a> {
@@ -3260,28 +3353,47 @@ impl<'a> CompositeReader<'a> {
                 found: nfields,
             });
         }
-        Ok(CompositeReader { rest })
+        Ok(CompositeReader { rest, field_idx: 0 })
     }
 
-    /// Read the next field: its 4-byte type OID (read and IGNORED — dynamic,
-    /// per the guarantee boundary) and 4-byte length, then its body. Returns
-    /// `Ok(None)` for a NULL field (`len == -1`), `Ok(Some(body))` for a present
+    /// Read the next field with optional type OID validation: reads the 4-byte
+    /// wire type OID and 4-byte length, then its body.
+    ///
+    /// If `expected_oid != 0`, validates that the wire OID matches `expected_oid`,
+    /// returning [`DecodeError::CompositeFieldOidMismatch`] on discrepancy.
+    /// When `expected_oid == 0`, the wire OID is accepted unconditionally (for
+    /// dynamic server-assigned OIDs such as user enums or domains).
+    ///
+    /// Returns `Ok(None)` for a NULL field (`len == -1`), `Ok(Some(body))` for a present
     /// field's binary value bytes.
     ///
     /// # Errors
     ///
     /// [`DecodeError::CompositeTruncated`] when the remainder is too short for
     /// the `{oid, len}` header or the declared body, or the length is negative
-    /// and not the `-1` NULL sentinel.
+    /// and not the `-1` NULL sentinel; [`DecodeError::CompositeFieldOidMismatch`]
+    /// when `expected_oid != 0` and wire OID differs from `expected_oid`.
     #[inline]
-    pub fn next_field(&mut self) -> Result<Option<&'a [u8]>, DecodeError> {
-        let (_oid_bytes, after_oid) = self
+    pub fn next_field_with_oid(
+        &mut self,
+        expected_oid: u32,
+    ) -> Result<Option<&'a [u8]>, DecodeError> {
+        let (oid_bytes, after_oid) = self
             .rest
             .split_first_chunk::<4>()
             .ok_or(DecodeError::CompositeTruncated)?;
-        // The field's wire type OID is server-assigned / dynamic (a domain or
-        // enum field carries its own OID), so it is READ past and NOT validated;
-        // the decode is checked by position + arity + each field's own decode.
+        let wire_oid = u32::from_be_bytes(*oid_bytes);
+        let curr_idx = self.field_idx;
+        self.field_idx = self.field_idx.saturating_add(1);
+
+        if expected_oid != 0 && wire_oid != expected_oid {
+            return Err(DecodeError::CompositeFieldOidMismatch {
+                index: curr_idx,
+                expected: expected_oid,
+                found: wire_oid,
+            });
+        }
+
         let (len_bytes, after_len) = after_oid
             .split_first_chunk::<4>()
             .ok_or(DecodeError::CompositeTruncated)?;
@@ -3299,6 +3411,20 @@ impl<'a> CompositeReader<'a> {
             .ok_or(DecodeError::CompositeTruncated)?;
         self.rest = after_body;
         Ok(Some(body))
+    }
+
+    /// Read the next field without OID validation (dynamic type).
+    ///
+    /// Forwards to [`Self::next_field_with_oid`] with `expected_oid = 0`.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::CompositeTruncated`] when the remainder is too short for
+    /// the `{oid, len}` header or the declared body, or the length is negative
+    /// and not the `-1` NULL sentinel.
+    #[inline]
+    pub fn next_field(&mut self) -> Result<Option<&'a [u8]>, DecodeError> {
+        self.next_field_with_oid(0)
     }
 
     /// Assert the frame is fully consumed. A trailing surplus past the last
@@ -5734,6 +5860,30 @@ mod parse_edge_case_tests {
     }
 
     #[test]
+    fn parse_row_desc_and_names_matches() {
+        let mut payload = alloc::vec::Vec::new();
+        payload.extend_from_slice(&2i16.to_be_bytes()); // 2 columns
+        // col 1: "id" int4
+        payload.extend_from_slice(b"id\0");
+        payload.extend_from_slice(&[0; 6]); // table_oid, attr_num
+        payload.extend_from_slice(&23u32.to_be_bytes()); // int4
+        payload.extend_from_slice(&4i16.to_be_bytes());
+        payload.extend_from_slice(&(-1i32).to_be_bytes());
+        payload.extend_from_slice(&0i16.to_be_bytes()); // text format
+        // col 2: "val" text
+        payload.extend_from_slice(b"val\0");
+        payload.extend_from_slice(&[0; 6]);
+        payload.extend_from_slice(&25u32.to_be_bytes()); // text
+        payload.extend_from_slice(&(-1i16).to_be_bytes());
+        payload.extend_from_slice(&(-1i32).to_be_bytes());
+        payload.extend_from_slice(&0i16.to_be_bytes());
+
+        let (oids, names) = parse_row_desc_and_names(&payload).expect("parse unified");
+        assert_eq!(oids, alloc::vec![23, 25]);
+        assert_eq!(names, alloc::vec![alloc::string::String::from("id"), alloc::string::String::from("val")]);
+    }
+
+    #[test]
     fn parse_param_description_zero_params() {
         // A no-param prepared statement: count 0, no OIDs.
         assert_eq!(parse_param_description(&[0, 0]), Some(alloc::vec::Vec::new()));
@@ -6496,5 +6646,41 @@ mod composite_reader_tests {
         let mut r = CompositeReader::new(&frame, 1).expect("arity 1");
         assert_eq!(r.next_field(), Ok(Some(&five[..])));
         assert!(matches!(r.finish(), Err(DecodeError::CompositeTruncated)));
+    }
+
+    #[test]
+    fn field_oid_validation_accepts_matching_oid() {
+        let five = 5i32.to_be_bytes();
+        let frame = build_composite(&[(oids::INT4, Some(&five))]);
+        let mut r = CompositeReader::new(&frame, 1).expect("arity 1");
+        assert_eq!(r.next_field_with_oid(oids::INT4), Ok(Some(&five[..])));
+        assert_eq!(r.finish(), Ok(()));
+    }
+
+    #[test]
+    fn field_oid_validation_rejects_mismatched_oid() {
+        let five = 5i32.to_be_bytes();
+        // Server sends FLOAT4 (OID 700) where INT4 (OID 23) was expected
+        let frame = build_composite(&[(oids::FLOAT4, Some(&five))]);
+        let mut r = CompositeReader::new(&frame, 1).expect("arity 1");
+        let got = r.next_field_with_oid(oids::INT4);
+        assert_eq!(
+            got,
+            Err(DecodeError::CompositeFieldOidMismatch {
+                index: 0,
+                expected: oids::INT4,
+                found: oids::FLOAT4,
+            })
+        );
+    }
+
+    #[test]
+    fn field_oid_validation_accepts_zero_for_dynamic_user_types() {
+        let five = 5i32.to_be_bytes();
+        // Dynamic OID 99999 is accepted when expected_oid is 0
+        let frame = build_composite(&[(99999, Some(&five))]);
+        let mut r = CompositeReader::new(&frame, 1).expect("arity 1");
+        assert_eq!(r.next_field_with_oid(0), Ok(Some(&five[..])));
+        assert_eq!(r.finish(), Ok(()));
     }
 }

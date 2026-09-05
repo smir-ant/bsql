@@ -20,7 +20,7 @@
 //! from a downstream consumer's POV after re-export. Without this
 //! file, a hypothetical regression that demoted the re-export to
 //! `pub(crate)` would only fire on driver compile, not on
-//! `cargo test -p bsql-pg-proto`.
+//! `cargo test -p bsql-postgres-proto`.
 //!
 //! Mirror of `tests/terminate_wire_spec.rs` — same shape, same
 //! tier-1 closure pattern.

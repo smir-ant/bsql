@@ -9,3 +9,7 @@ note: constructor is not visible here due to private fields
   |
   | pub struct SafeTable<'a>(&'a str);
   |                          ^^^^^^^ private field
+help: you might have meant to use the `from_static` associated function
+  |
+9 |     let _ = SafeTable::from_static("users; DROP TABLE users --");
+  |                      +++++++++++++

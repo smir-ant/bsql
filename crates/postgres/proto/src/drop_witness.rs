@@ -234,7 +234,7 @@ impl<T> Drop for DropCounter<T> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Manifest — every secret-bearing type in `bsql-pg-proto`.
+// Manifest — every secret-bearing type in `bsql-postgres-proto`.
 // ═════════════════════════════════════════════════════════════════════
 //
 // **Tier-1 by-construction**: the integration test
@@ -283,26 +283,26 @@ pub(crate) trait CrateZeroizeSecret: sealed::Sealed {}
 // originating definition site.
 // ─────────────────────────────────────────────────────────────────────
 
-// `bsql-pg-proto::engine::SendBuf` — engine-owned outbound send buffer.
+// `bsql-postgres-proto::engine::SendBuf` — engine-owned outbound send buffer.
 // Manual Drop impl scrubs the FULL `Vec` capacity (`self.buf.zeroize()`),
 // including the spare capacity where `reset`'s truncate leaves already-sent
 // secret residue.
 impl sealed::Sealed for crate::engine::SendBuf {}
 impl CrateZeroizeSecret for crate::engine::SendBuf {}
 
-// `bsql-pg-proto::engine::IngestBuf` — two-tier single-residence ingest
+// `bsql-postgres-proto::engine::IngestBuf` — two-tier single-residence ingest
 // buffer. Manual Drop impl zeroizes BOTH the inline array and the heap-Box
 // array (if escaped) once on teardown.
 impl sealed::Sealed for crate::engine::IngestBuf {}
 impl CrateZeroizeSecret for crate::engine::IngestBuf {}
 
-// `bsql-pg-proto::ident::SecretBoundedStr<N>` — manual `impl Zeroize`
+// `bsql-postgres-proto::ident::SecretBoundedStr<N>` — manual `impl Zeroize`
 // at `ident.rs:702` + manual `impl Drop` at `ident.rs:711`. Drop body
 // calls `self.inner.zeroize_in_place()`.
 impl<const N: usize> sealed::Sealed for crate::ident::SecretBoundedStr<N> {}
 impl<const N: usize> CrateZeroizeSecret for crate::ident::SecretBoundedStr<N> {}
 
-// `bsql-pg-proto::md5::Md5HandshakeState` — `derive(ZeroizeOnDrop)`
+// `bsql-postgres-proto::md5::Md5HandshakeState` — `derive(ZeroizeOnDrop)`
 // at `md5.rs:94`. Carries `Sensitive<Password>` (zeroized) +
 // `Ident` (skip). Present only under the `md5-auth` feature — with MD5 auth
 // off the type does not exist. (The exhaustiveness gate's scan is cfg-blind
@@ -312,12 +312,12 @@ impl sealed::Sealed for crate::md5::Md5HandshakeState {}
 #[cfg(feature = "md5-auth")]
 impl CrateZeroizeSecret for crate::md5::Md5HandshakeState {}
 
-// `bsql-pg-proto::password::Password` — `derive(Zeroize, ZeroizeOnDrop)`
+// `bsql-postgres-proto::password::Password` — `derive(Zeroize, ZeroizeOnDrop)`
 // at `password.rs:79`. Backing `[u8; MAX_PASSWORD_LEN]` + `u16` len.
 impl sealed::Sealed for crate::password::Password {}
 impl CrateZeroizeSecret for crate::password::Password {}
 
-// `bsql-pg-proto::scram::session::ScramSession` — `derive(Zeroize,
+// `bsql-postgres-proto::scram::session::ScramSession` — `derive(Zeroize,
 // ZeroizeOnDrop)` at `scram/session.rs:89`. Carries
 // `Sensitive<Password>` + 2× skip-zeroized `PodBytes`. Present only under the
 // `scram` feature — with SCRAM off the type does not exist.
@@ -326,7 +326,7 @@ impl sealed::Sealed for crate::scram::session::ScramSession {}
 #[cfg(feature = "scram")]
 impl CrateZeroizeSecret for crate::scram::session::ScramSession {}
 
-// `bsql-pg-proto::scram::types::SecretDigest` — `derive(Zeroize,
+// `bsql-postgres-proto::scram::types::SecretDigest` — `derive(Zeroize,
 // ZeroizeOnDrop)` at `scram/types.rs:22`. Backing `[u8; 32]`. Present only under
 // the `scram` feature.
 #[cfg(feature = "scram")]
@@ -334,13 +334,13 @@ impl sealed::Sealed for crate::scram::types::SecretDigest {}
 #[cfg(feature = "scram")]
 impl CrateZeroizeSecret for crate::scram::types::SecretDigest {}
 
-// `bsql-pg-proto::sensitive::Sensitive<T>` — `derive(Zeroize,
+// `bsql-postgres-proto::sensitive::Sensitive<T>` — `derive(Zeroize,
 // ZeroizeOnDrop)` at `sensitive.rs:33`. Transparent wrapper over
 // `T: Zeroize`.
 impl<T: zeroize::Zeroize> sealed::Sealed for crate::sensitive::Sensitive<T> {}
 impl<T: zeroize::Zeroize> CrateZeroizeSecret for crate::sensitive::Sensitive<T> {}
 
-// `bsql-pg-proto::write_buf::WriteBuf` — manual Drop impl at
+// `bsql-postgres-proto::write_buf::WriteBuf` — manual Drop impl at
 // `write_buf.rs:673`. Body: `inner.as_mut_slice().zeroize()`.
 impl sealed::Sealed for crate::write_buf::WriteBuf {}
 impl CrateZeroizeSecret for crate::write_buf::WriteBuf {}

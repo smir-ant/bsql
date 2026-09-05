@@ -303,7 +303,7 @@ fn unicode_values() {
 
 #[test]
 fn transaction_closure_commit() {
-    let conn = Connection::open_in_memory().expect("open");
+    let mut conn = Connection::open_in_memory().expect("open");
     conn.execute_raw("CREATE TABLE t(v int)").expect("create");
     conn.transaction(|c| {
         c.execute_raw("INSERT INTO t VALUES (1)")?;
@@ -316,7 +316,7 @@ fn transaction_closure_commit() {
 
 #[test]
 fn transaction_closure_rollback_on_err() {
-    let conn = Connection::open_in_memory().expect("open");
+    let mut conn = Connection::open_in_memory().expect("open");
     conn.execute_raw("CREATE TABLE t(v int)").expect("create");
     conn.execute_raw("INSERT INTO t VALUES (1)").expect("seed");
     let err: Result<(), _> = conn.transaction(|c| {
@@ -330,7 +330,7 @@ fn transaction_closure_rollback_on_err() {
 
 #[test]
 fn transaction_closure_return_value() {
-    let conn = Connection::open_in_memory().expect("open");
+    let mut conn = Connection::open_in_memory().expect("open");
     conn.execute_raw("CREATE TABLE t(v int)").expect("create");
     let count = conn
         .transaction(|c| {
@@ -665,7 +665,7 @@ fn query_each_classified_error_mid_stream() {
 
 #[test]
 fn full_lifecycle_integration() {
-    let conn = Connection::open_in_memory().expect("open");
+    let mut conn = Connection::open_in_memory().expect("open");
 
     conn.execute_batch_raw("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, score REAL);")
         .expect("create");

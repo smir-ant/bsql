@@ -195,3 +195,22 @@ fn field_names_colliding_with_generated_locals_still_decode() {
     assert_eq!(c2.__bytes, None);
     assert_eq!(c2.ok, Some(11));
 }
+
+#[test]
+fn addr_field_oid_mismatch_is_classified() {
+    let five = 5i32.to_be_bytes();
+    // Second field is declared as int4 (OID 23), but wire frame sends float4 (OID 700)
+    let bad_frame = frame(&[
+        (OID_TEXT, Some(b"main st")),
+        (700, Some(&five)),
+    ]);
+    let err = Addr::decode_row(&bad_frame).expect_err("mismatched field OID must fail closed");
+    assert_eq!(
+        err,
+        DecodeError::CompositeFieldOidMismatch {
+            index: 1,
+            expected: OID_INT4,
+            found: 700,
+        }
+    );
+}

@@ -168,6 +168,9 @@ pub use types::{
 /// type without a direct proto dep.
 pub use bsql_postgres_proto::command_tag::CommandTag;
 
+/// The connection's transaction status (`Idle`, `InTransaction`, `Failed`).
+pub use bsql_postgres_proto::action::TxStatus;
+
 /// The sealed parameter-encoding contract every `*_params` / typed verb takes
 /// (`&(a, b)` tuples up to arity 16). Re-exported so a consumer can write a
 /// generic helper — `fn run<P: ParamsWriter>(…)` — without a direct proto dep.

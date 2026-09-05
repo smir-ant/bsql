@@ -84,6 +84,7 @@ name = "bsql-build"
 version = "1.0.0-alpha.4"
 dependencies = [
  "rusqlite",
+ "sha2",
  "sqlparser",
 ]
 

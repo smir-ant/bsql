@@ -206,7 +206,8 @@ fn stage_prelude<E>(
     // a lost transaction. A successful drain clears it (`finish_prelude`).
     if let Some(sql) = active.pending_prelude() {
         core::hint::cold_path();
-        enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
+        frames::build_simple_query(&mut send_buf.frame(), sql.as_bytes())
+            .map_err(frame_too_long)?;
         active.arm_prelude();
     }
     Ok(())
@@ -222,8 +223,8 @@ fn stage_prelude<E>(
 /// put different bytes on the wire for the same SQL).
 ///
 /// The SQL body streams directly onto the (growable) send buffer rather than
-/// being copied into the bounded [`WriteBuf`]: only the 5-byte header is built
-/// into the scratch buffer, so a multi-kilobyte query is not capped at
+/// being copied into the bounded [`WriteBuf`]: the 5-byte header is built
+/// directly into the send buffer frame, so a multi-kilobyte query is not capped at
 /// `MAX_OWNED_SEND_LEN`. The flushed bytes — header, SQL, NUL — are contiguous
 /// and byte-identical to the whole-frame builder's output.
 #[inline]
@@ -239,7 +240,8 @@ fn stage_simple_query<E>(
         core::hint::cold_path();
         EngineError::FrameTooLong
     })?;
-    enqueue_frame(send_buf, |wb| frames::build_simple_query_header(wb, sql_len))?;
+    frames::build_simple_query_header(&mut send_buf.frame(), sql_len)
+        .map_err(frame_too_long)?;
     send_buf.enqueue(sql_bytes);
     send_buf.enqueue(&[0]);
     Ok(())
@@ -1501,6 +1503,9 @@ impl<'b, T: Transport> Engine<'b, T> {
     /// no I/O.
     #[inline]
     pub fn stage_pipeline_seal(&mut self) {
+        if let Ok(active) = self.phase.as_active_mut() {
+            active.mark_pipeline_sync_staged();
+        }
         self.send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
     }
 
@@ -1925,7 +1930,8 @@ impl<'b, T: Transport> Engine<'b, T> {
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
         stage_prelude(active, send_buf)?;
-        enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
+        frames::build_simple_query(&mut send_buf.frame(), sql.as_bytes())
+            .map_err(frame_too_long)?;
         super::flush::flush(send_buf, transport).await?;
         // Drain a fused prelude's response (e.g. a deferred BEGIN) NOW, so the COPY
         // stream that follows starts at the COPY command's own reply, not the
@@ -2050,6 +2056,59 @@ impl<'b, T: Transport> Engine<'b, T> {
         // shared `ParamsWriter` field encoders.
         frames::build_copy_binary_row(&mut send_buf.frame(), row).map_err(frame_too_long)?;
         // Flush only when the batch crosses the threshold.
+        if send_buf.pending_len() >= COPY_IN_FLUSH_THRESHOLD {
+            super::flush::flush(send_buf, transport).await?;
+        }
+        Ok(())
+    }
+
+    /// Stream the entire PGCOPY BINARY stream (file header, all typed rows, and
+    /// trailer) as batched 64 KiB aggregated `CopyData` frames.
+    ///
+    /// Rather than wrapping each row in its own individual 5-byte `'d'` frame header,
+    /// multiple rows are packed into a single 64 KiB `CopyData` frame, reducing
+    /// wire framing overhead by 100-1000x and eliminating millions of length backpatches
+    /// and frame dispatches on both client and PostgreSQL server.
+    ///
+    /// The buffer flushes to the transport whenever pending bytes cross
+    /// [`COPY_IN_FLUSH_THRESHOLD`]. Oversized rows (> 64 KiB) grow the buffer
+    /// dynamically, seal their frame, and flush immediately without splitting.
+    /// Frame sealing is atomic: no unsealed frame ever touches the wire.
+    pub async fn copy_in_stream_typed_binary<P: ParamsWriter, I: IntoIterator<Item = P>>(
+        &mut self,
+        rows: I,
+    ) -> Result<(), EngineError<T::Error>> {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        send_buf.reset();
+
+        // Start the first aggregated CopyData frame.
+        let mut len_offset = send_buf.begin_copy_frame();
+        send_buf.enqueue(&crate::copy_binary::PGCOPY_BINARY_HEADER);
+
+        for row in rows {
+            frames::build_copy_binary_row_body(&mut send_buf.frame(), &row)
+                .map_err(frame_too_long)?;
+
+            // If the aggregated frame has grown to or past the flush threshold,
+            // seal it and flush to the transport.
+            if send_buf.pending_len() >= COPY_IN_FLUSH_THRESHOLD {
+                send_buf.seal_copy_frame(len_offset).map_err(frame_too_long)?;
+                super::flush::flush(send_buf, transport).await?;
+                send_buf.reset();
+                len_offset = send_buf.begin_copy_frame();
+            }
+        }
+
+        // Enqueue the 2-byte trailer (-1 as i16) into the final active frame.
+        send_buf.enqueue(&crate::copy_binary::PGCOPY_BINARY_TRAILER);
+        send_buf.seal_copy_frame(len_offset).map_err(frame_too_long)?;
+
         if send_buf.pending_len() >= COPY_IN_FLUSH_THRESHOLD {
             super::flush::flush(send_buf, transport).await?;
         }
@@ -2186,7 +2245,8 @@ impl<'b, T: Transport> Engine<'b, T> {
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
         stage_prelude(active, send_buf)?;
-        enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
+        frames::build_simple_query(&mut send_buf.frame(), sql.as_bytes())
+            .map_err(frame_too_long)?;
         let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
         match boundary {
             Boundary::Idle => Ok(Outcome {

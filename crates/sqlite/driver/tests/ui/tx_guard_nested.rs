@@ -9,7 +9,7 @@
 use bsql_sqlite::Connection;
 
 fn main() {
-    let conn = Connection::open_in_memory().expect("open");
+    let mut conn = Connection::open_in_memory().expect("open");
     let _ = conn.transaction(|tx| {
         // Nested transaction: the classic "cannot start a transaction within a
         // transaction" runtime error is now unrepresentable.

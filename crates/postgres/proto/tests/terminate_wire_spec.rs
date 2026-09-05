@@ -19,7 +19,7 @@
 //! the same literal is correct from a downstream consumer's POV
 //! after re-export. Without this file, a hypothetical regression
 //! that demoted the re-export to `pub(crate)` would only fire on
-//! driver compile, not on `cargo test -p bsql-pg-proto`.
+//! driver compile, not on `cargo test -p bsql-postgres-proto`.
 
 #![forbid(unsafe_code)]
 #![forbid(

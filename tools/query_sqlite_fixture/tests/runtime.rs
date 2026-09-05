@@ -189,7 +189,7 @@ fn typed_query_each_streams() {
 
 #[test]
 fn typed_verbs_on_the_transaction_guard() {
-    let conn = seed();
+    let mut conn = seed();
     let ids: Vec<i64> = conn
         .transaction(|tx| {
             let rows = tx.query::<Measurement>(()).expect("typed in tx");

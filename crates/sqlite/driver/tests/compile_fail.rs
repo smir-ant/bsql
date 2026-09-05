@@ -27,3 +27,13 @@ fn transaction_guard_rejects_lifecycle_verbs() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/tx_guard_nested.rs");
 }
+
+/// The closure exclusively borrows `&mut Connection`, so attempting to capture
+/// `conn` inside the closure to execute queries or re-enter `transaction` is
+/// statically rejected by the borrow checker at compile time (E0502/E0500).
+#[test]
+fn transaction_guard_rejects_conn_capture() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/tx_capture_conn.rs");
+}
+

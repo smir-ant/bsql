@@ -73,7 +73,7 @@ pub use bsql_postgres_core::{
     AppliedMigration, BorrowedRow, ChannelBindingMode, ColumnError, CommandTag, ConnectConfig, DbError, DiagEvent, DiagSink, Diagnostics, PoolStats, DriftKind, DriverError,
     MigrationError, MigrationReport, MigrationSource, MigrationSourceError, MigrationStatus,
     Notification, ParamsWriter, QueryResult, Row, RowRef, Rows, SafeIdent, SafeTable, SslMode,
-    TypedNotification, LEDGER_TABLE,
+    TxStatus, TypedNotification, LEDGER_TABLE,
 };
 
 // The diagnostics-only N+1 detector (feature `n1-detect`). Re-exported so

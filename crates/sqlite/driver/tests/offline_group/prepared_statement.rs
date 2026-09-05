@@ -260,17 +260,16 @@ fn typed_query_each_streams() {
 
 // ── Transaction interplay ────────────────────────────────────────────────────
 
-/// A statement prepared on the CONNECTION runs correctly INSIDE a
-/// `transaction` closure (same db handle, within the current transaction): the
-/// writes are visible mid-transaction and, on rollback, disappear.
+/// A statement prepared inside the transaction runs correctly:
+/// the writes are visible mid-transaction and, on rollback, disappear.
 #[test]
-fn conn_prepared_statement_runs_inside_transaction() {
-    let conn = Connection::open_in_memory().expect("open");
+fn tx_prepared_statement_runs_inside_transaction() {
+    let mut conn = Connection::open_in_memory().expect("open");
     conn.execute_raw("CREATE TABLE t (v INTEGER NOT NULL)").expect("create");
-    let mut ins = conn.prepare_raw("INSERT INTO t (v) VALUES (?1)").expect("prepare");
 
     // Commit path: 10 inserts inside a committed transaction persist.
-    conn.transaction(|_tx| {
+    conn.transaction(|tx| {
+        let mut ins = tx.prepare_raw("INSERT INTO t (v) VALUES (?1)")?;
         for i in 0..10_i64 {
             ins.execute(&[ValueRef::Integer(i)])?;
         }
@@ -284,7 +283,8 @@ fn conn_prepared_statement_runs_inside_transaction() {
 
     // Rollback path: an error propagated out of the closure rolls back the
     // statement's writes — the reused handle honored the transaction boundary.
-    let outcome: Result<(), SqliteError> = conn.transaction(|_tx| {
+    let outcome: Result<(), SqliteError> = conn.transaction(|tx| {
+        let mut ins = tx.prepare_raw("INSERT INTO t (v) VALUES (?1)")?;
         for i in 100..110_i64 {
             ins.execute(&[ValueRef::Integer(i)])?;
         }

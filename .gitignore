@@ -11,24 +11,6 @@
 # Claude Code session data
 .claude/
 
-# Sort enum registry (generated at compile time by #[bsql::sort])
-# Each enum writes its SQL fragments here for query! to validate.
-# Regenerated on every build — not source-controlled.
-.bsql/sorts/
-
-# Examples crate has its own standalone cache that gets regenerated
-# whenever someone runs `cargo run --bin <example>` locally. Not worth
-# committing — the examples each validate against whatever DB the user
-# has BSQL_DATABASE_URL pointed at.
-examples/.bsql/
-
-# Per-crate caches: rust-analyzer / cargo test inside a crate directory
-# creates a `.bsql/` there too. Only the workspace-root `.bsql/queries/`
-# is the canonical cache — committing per-crate directories would
-# duplicate entries and confuse the manifest.
-crates/*/.bsql/
-
-TODO
 *.txt
 
 # The deps_pin gate's goldens ARE source of truth (like the trybuild

@@ -47,7 +47,7 @@ fn seed() -> Connection {
 /// SELECT — read-only), and the connection is reusable afterwards.
 #[test]
 fn n_reads_return_a_count_vec_and_commit() {
-    let conn = seed();
+    let mut conn = seed();
     let counts = conn
         .execute_batch::<EbWeightById>(vec![(1_i64,), (2,), (1,)])
         .expect("batch runs");
@@ -59,7 +59,7 @@ fn n_reads_return_a_count_vec_and_commit() {
 /// N == 0 → an empty `Vec<u64>` (an empty transaction).
 #[test]
 fn zero_is_empty() {
-    let conn = seed();
+    let mut conn = seed();
     let counts = conn
         .execute_batch::<EbWeightById>(Vec::<(i64,)>::new())
         .expect("N=0");
@@ -70,7 +70,7 @@ fn zero_is_empty() {
 /// nested BEGIN), and its counts flow out.
 #[test]
 fn inside_a_transaction_guard() {
-    let conn = seed();
+    let mut conn = seed();
     let counts = conn
         .transaction(|tx| tx.execute_batch::<EbWeightById>(vec![(1_i64,), (2,)]))
         .expect("guard commits");

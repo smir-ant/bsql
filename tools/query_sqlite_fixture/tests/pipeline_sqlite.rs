@@ -48,7 +48,7 @@ fn seed() -> Connection {
 /// against ITS carrier's compile-time record shape into its own `TypedRows<Qi>`.
 #[test]
 fn heterogeneous_typed_batch_decodes_per_element() {
-    let conn = seed();
+    let mut conn = seed();
     let (w, label, count) = conn
         .pipeline((
             PlWeightById::bind((1,)),
@@ -67,7 +67,7 @@ fn heterogeneous_typed_batch_decodes_per_element() {
 /// A one-command pipeline is the degenerate (still-atomic) case, same typed tuple.
 #[test]
 fn single_command_pipeline() {
-    let conn = seed();
+    let mut conn = seed();
     let (w,) = conn
         .pipeline((PlWeightById::bind((1,)),))
         .expect("single-command pipeline");

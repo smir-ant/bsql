@@ -1006,7 +1006,7 @@ pub enum SslNegotiationOutcome {
     ///   `StartupMessage`.
     /// - `require`/`verify-ca`/`verify-full`: refuse the connection.
     ///
-    /// `bsql-pg-proto` itself does NOT enforce policy — that is a
+    /// `bsql-postgres-proto` itself does NOT enforce policy — that is a
     /// driver-level concern (the protocol crate has no I/O knowledge
     /// of which mode the user requested).
     Refused,

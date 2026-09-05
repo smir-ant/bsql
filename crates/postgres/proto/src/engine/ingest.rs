@@ -68,7 +68,7 @@
 //! outstanding borrow: by the time a mutating call runs, no borrow from a
 //! prior one is alive.
 
-use crate::frame::{parse_header, HeaderParse, HEADER_LEN, READ_BUF_CAP};
+use crate::frame::{parse_header, HeaderParse, HEADER_LEN, MAX_FRAME_LEN_FIELD, READ_BUF_CAP};
 use crate::narrow::usize_from_u32;
 use alloc::boxed::Box;
 use core::fmt;
@@ -443,6 +443,64 @@ impl IngestBuf {
         let new_cursor = u16::try_from(new_cursor).ok()?;
         self.cursor = new_cursor;
         Some((tag, body_start, body_end))
+    }
+
+    /// Single-pass header validation and frame extraction.
+    ///
+    /// Fuses [`peek_header`](Self::peek_header) and [`take_frame`](Self::take_frame)
+    /// into a single pass: loads the 5-byte header, checks bounds, byte-swaps the
+    /// big-endian length, and advances the cursor immediately when a full frame is
+    /// resident. Eliminates duplicate byte-swapping and bounds checks on the hot
+    /// row-dispatch path.
+    #[inline(never)]
+    pub fn take_frame_fast(&mut self) -> Result<Option<(u8, usize, usize)>, HeaderParse> {
+        let cursor = usize::from(self.cursor);
+        let filled = usize::from(self.filled);
+        let unread = filled.saturating_sub(cursor);
+        if unread < HEADER_LEN {
+            if unread == 0 {
+                return Err(HeaderParse::Empty);
+            }
+            return Err(HeaderParse::Incomplete);
+        }
+        let active = self.active();
+        let tag = match active.get(cursor) {
+            Some(&t) => t,
+            None => return Err(HeaderParse::Incomplete),
+        };
+        let len_lo = cursor.saturating_add(1);
+        let len_hi = cursor.saturating_add(HEADER_LEN);
+        let arr: [u8; 4] = match active.get(len_lo..len_hi) {
+            Some(bytes) => match bytes.try_into() {
+                Ok(arr) => arr,
+                Err(_) => return Err(HeaderParse::Incomplete),
+            },
+            None => return Err(HeaderParse::Incomplete),
+        };
+        let declared = u32::from_be_bytes(arr);
+        if declared < 4 {
+            core::hint::cold_path();
+            return Err(HeaderParse::MalformedLength { declared });
+        }
+        if declared > MAX_FRAME_LEN_FIELD {
+            core::hint::cold_path();
+            return Err(HeaderParse::FrameTooLarge { declared });
+        }
+        let total = usize_from_u32(declared).saturating_add(1);
+        if unread < total {
+            return Ok(None);
+        }
+        let body_start = cursor.saturating_add(HEADER_LEN);
+        let body_end = cursor.saturating_add(total);
+        let new_cursor = match usize::from(self.cursor).checked_add(total) {
+            Some(c) => match u16::try_from(c) {
+                Ok(c16) => c16,
+                Err(_) => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        self.cursor = new_cursor;
+        Ok(Some((tag, body_start, body_end)))
     }
 
     /// Borrow a frame body by the offset range returned from

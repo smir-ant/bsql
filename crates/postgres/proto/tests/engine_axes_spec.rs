@@ -494,7 +494,9 @@ const ACTIVE_VERBS: usize = 28;
 /// a pipeline intermediate window (a `Flush`, no `Sync`) parks a result-OID
 /// mismatch, the drain cannot reach an RFQ, so the pump returns `Failed` on the
 /// rare parked-mismatch branch (const-folded away for every non-guarded caller).
-const COLD_CLASSIFIED_BRANCHES: usize = 58;
+/// 58 → 60: `take_frame_fast` in `ingest.rs` marks the malformed declared < 4 and
+/// `declared > MAX_FRAME_LEN_FIELD` branches as cold via `core::hint::cold_path()`.
+const COLD_CLASSIFIED_BRANCHES: usize = 60;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

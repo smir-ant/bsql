@@ -888,6 +888,25 @@ impl ConnectConfig {
         self.with_startup_param("statement_timeout", ms.to_string())
     }
 
+    /// Set a default server-side `statement_timeout` if one has not already been configured.
+    ///
+    /// If `statement_timeout` was already set via [`with_statement_timeout`](Self::with_statement_timeout)
+    /// or [`with_startup_param`](Self::with_startup_param), this is a no-op, preserving explicit
+    /// configuration. Otherwise, it applies `timeout`, arming a bounded [`client_liveness_window`](Self::client_liveness_window)
+    /// that guards steady-state reads against silent TCP black-hole proxy drops.
+    #[must_use]
+    pub fn with_default_statement_timeout(self, timeout: Duration) -> Self {
+        if self
+            .startup_params
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("statement_timeout"))
+        {
+            self
+        } else {
+            self.with_statement_timeout(timeout)
+        }
+    }
+
     /// Borrow the raw, not-yet-validated startup parameters, in insertion
     /// order. The drivers validate each into a wire `StartupParam` at connect.
     #[must_use]
@@ -1922,6 +1941,24 @@ mod tests {
                 .with_startup_param("statement_timeout", "30s")
                 .client_liveness_window(),
             Some(Duration::from_millis(30_000)),
+        );
+    }
+
+    #[test]
+    fn with_default_statement_timeout_applies_only_when_unset() {
+        let unset = ConnectConfig::new("h", "u")
+            .with_default_statement_timeout(Duration::from_secs(30));
+        assert_eq!(
+            unset.client_liveness_window(),
+            Some(Duration::from_secs(40)) // 30s + default 10s connect_timeout
+        );
+
+        let explicit = ConnectConfig::new("h", "u")
+            .with_statement_timeout(Duration::from_secs(10))
+            .with_default_statement_timeout(Duration::from_secs(30));
+        assert_eq!(
+            explicit.client_liveness_window(),
+            Some(Duration::from_secs(20)) // 10s + default 10s connect_timeout (not overridden)
         );
     }
 

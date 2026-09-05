@@ -29,7 +29,8 @@ pub(crate) struct ColSlot {
 }
 
 impl ColSlot {
-    fn null() -> Self {
+    #[inline]
+    pub(crate) const fn null() -> Self {
         Self { offset: 0, len_plus_one: None }
     }
 
@@ -38,10 +39,12 @@ impl ColSlot {
     /// `len + 1` that already rejected `len == u32::MAX`, so this constructor
     /// never sees a saturated or wrapped value — the bad state is unrepresentable
     /// here by the time it is reached.
-    fn value(offset: u32, len_plus_one: NonZeroU32) -> Self {
+    #[inline]
+    pub(crate) fn value(offset: u32, len_plus_one: NonZeroU32) -> Self {
         Self { offset, len_plus_one: Some(len_plus_one) }
     }
 
+    #[inline]
     fn byte_len(&self) -> Option<u32> {
         // `len_plus_one` is always a checked `len + 1 >= 1`, so `- 1` cannot
         // underflow. The `?` propagates SQL NULL (no value), not an error.
@@ -51,6 +54,101 @@ impl ColSlot {
 
 // Compile-time size pin: ColSlot must be exactly 8 bytes (niche-packed).
 const _: () = assert!(core::mem::size_of::<ColSlot>() == 8);
+
+/// Reusable scratch buffer for streamed rows.
+///
+/// Holds up to 16 columns inline on the stack (128 bytes) — covering the vast
+/// majority of production SQL schemas — and spills to a reused heap `Vec` only
+/// for wide rows (> 16 columns). Once spilled, the heap buffer is retained
+/// across rows, preserving the steady-state zero-allocation streaming invariant.
+#[derive(Debug)]
+pub(crate) struct SlotsScratch {
+    inline: [ColSlot; 16],
+    len: usize,
+    spill: Vec<ColSlot>,
+}
+
+impl SlotsScratch {
+    /// Create a fresh scratch buffer with inline capacity for 16 columns.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            inline: [ColSlot::null(); 16],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// Clear all slots, retaining any allocated heap capacity.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.spill.clear();
+    }
+
+    /// Push a column slot into the scratch buffer.
+    #[inline]
+    pub fn push(&mut self, slot: ColSlot) {
+        if self.spill.capacity() > 0 {
+            self.spill.push(slot);
+        } else if self.len < 16 {
+            if let Some(target) = self.inline.get_mut(self.len) {
+                *target = slot;
+                self.len = self.len.saturating_add(1);
+            }
+        } else {
+            self.spill.reserve(self.len.saturating_add(1));
+            if let Some(src) = self.inline.get(..self.len) {
+                self.spill.extend_from_slice(src);
+            }
+            self.spill.push(slot);
+        }
+    }
+
+    /// Borrow the populated slots as a slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[ColSlot] {
+        if self.spill.capacity() > 0 {
+            &self.spill
+        } else {
+            match self.inline.get(..self.len) {
+                Some(slice) => slice,
+                None => &[],
+            }
+        }
+    }
+
+    /// Number of populated slots.
+    #[inline]
+    #[allow(dead_code, reason = "convenience accessor for scratch slot introspection")]
+    pub fn len(&self) -> usize {
+        if self.spill.capacity() > 0 {
+            self.spill.len()
+        } else {
+            self.len
+        }
+    }
+
+    /// Whether the scratch buffer is empty.
+    #[inline]
+    #[allow(dead_code, reason = "convenience accessor for scratch slot introspection")]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_spilled(&self) -> bool {
+        self.spill.capacity() > 0
+    }
+}
+
+impl Default for SlotsScratch {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ─── Arena ──────────────────────────────────────────────────
 
@@ -354,28 +452,39 @@ impl ArenaBuilder {
         }
     }
 
+    /// Whether any 32-bit bound or column constraint was exceeded.
+    #[inline]
+    #[must_use]
+    pub fn is_overflow(&self) -> bool {
+        self.overflow
+    }
+
     /// Append a non-NULL column holding `bytes` to the row under construction.
     /// An offset or length that would overflow the 32-bit arena bounds marks
     /// the builder so [`finish`](Self::finish) fails loudly — never a saturated
     /// offset that would mis-address bytes.
     pub fn push_value(&mut self, bytes: &[u8]) {
+        if self.overflow {
+            return;
+        }
         // Count this column toward the current row's width (checked at end_row).
         self.cols_in_row = self.cols_in_row.saturating_add(1);
-        // Offset and `len + 1` must both fit u32 (a NULL is encoded by the
-        // niche, so a real value needs `len + 1 >= 1`). On overflow, record a
-        // NULL placeholder and mark the builder so `finish()` fails loudly —
-        // never a saturated offset/length that would mis-address bytes.
-        let Ok(offset) = u32::try_from(self.data.len()) else {
-            self.overflow = true;
-            self.slots.push(ColSlot::null());
-            return;
-        };
-        let len_plus_one = u32::try_from(bytes.len())
-            .ok()
+        // Offset, length, and their sum must all fit u32 without overflow
+        // (a NULL is encoded by the niche, so a real value needs `len + 1 >= 1`).
+        // On overflow, record a NULL placeholder and mark the builder so `finish()`
+        // fails loudly — never a saturated offset/length that would mis-address bytes.
+        let offset = u32::try_from(self.data.len()).ok();
+        let bytes_len = u32::try_from(bytes.len()).ok();
+        let len_plus_one = bytes_len
             .and_then(|len| len.checked_add(1))
             .and_then(NonZeroU32::new);
-        match len_plus_one {
-            Some(lp1) => {
+        let checked = offset
+            .zip(bytes_len)
+            .filter(|(o, l)| o.checked_add(*l).is_some())
+            .zip(len_plus_one);
+
+        match checked {
+            Some(((offset, _), lp1)) => {
                 self.data.extend_from_slice(bytes);
                 self.slots.push(ColSlot::value(offset, lp1));
             }
@@ -388,6 +497,9 @@ impl ArenaBuilder {
 
     /// Append a SQL `NULL` column to the row under construction.
     pub fn push_null(&mut self) {
+        if self.overflow {
+            return;
+        }
         // Count this column toward the current row's width (checked at end_row).
         self.cols_in_row = self.cols_in_row.saturating_add(1);
         self.slots.push(ColSlot::null());
@@ -395,14 +507,20 @@ impl ArenaBuilder {
 
     /// Extend the last pushed column's data (for chunked columns).
     pub fn extend_last(&mut self, bytes: &[u8]) {
+        if self.overflow {
+            return;
+        }
         if let Some(slot) = self.slots.last_mut()
             && let Some(old_len) = slot.byte_len()
         {
             // New total `old_len + extra`, then `+ 1` for the niche encoding,
-            // all checked. On overflow mark the builder; do not saturate.
-            let new_lp1 = u32::try_from(bytes.len())
-                .ok()
-                .and_then(|extra| old_len.checked_add(extra))
+            // and `slot.offset + new_total` <= u32::MAX, all checked.
+            // On overflow mark the builder; do not saturate or extend data past 4 GiB.
+            let extra = u32::try_from(bytes.len()).ok();
+            let new_len = extra.and_then(|e| old_len.checked_add(e));
+            let fits_address_space =
+                new_len.filter(|&total| slot.offset.checked_add(total).is_some());
+            let new_lp1 = fits_address_space
                 .and_then(|total| total.checked_add(1))
                 .and_then(NonZeroU32::new);
             match new_lp1 {
@@ -421,6 +539,9 @@ impl ArenaBuilder {
     /// builder so [`finish`](Self::finish) fails loudly rather than mis-addressing
     /// cells against the fixed stride.
     pub fn end_row(&mut self) {
+        if self.overflow {
+            return;
+        }
         // Enforce the uniform-width invariant: a completed row must contribute
         // exactly `n_cols` slots, or the fixed stride would mis-address it.
         if self.cols_in_row != u32::from(self.n_cols) {
@@ -820,7 +941,7 @@ fn decode_text_f64(raw: Option<&[u8]>) -> Result<Option<f64>, ColumnError> {
 ///
 /// [`DecodeError`] — a malformed / truncated row body (propagated from
 /// [`DataRowRef`]), or an offset/length that overflows the 32-bit slot fields.
-pub(crate) fn fill_row_slots(body: &[u8], slots: &mut Vec<ColSlot>) -> Result<(), DecodeError> {
+pub(crate) fn fill_row_slots(body: &[u8], slots: &mut SlotsScratch) -> Result<(), DecodeError> {
     slots.clear();
     let row = DataRowRef::parse(body)?;
     // Body offset AFTER the 2-byte column-count header — where the first column's
@@ -900,10 +1021,13 @@ impl<'r> BorrowedRow<'r> {
     /// [`DecodeError`] — a malformed / truncated row body.
     pub(crate) fn parse(
         body: &'r [u8],
-        scratch: &'r mut Vec<ColSlot>,
+        scratch: &'r mut SlotsScratch,
     ) -> Result<Self, DecodeError> {
         fill_row_slots(body, scratch)?;
-        Ok(Self { body, slots: scratch })
+        Ok(Self {
+            body,
+            slots: scratch.as_slice(),
+        })
     }
 
     /// The number of columns in this row.
@@ -1100,33 +1224,36 @@ mod tests {
     fn borrowed_row_positional_decode_null_and_out_of_range() {
         // Three columns: a text-int `"42"`, a SQL NULL, and an empty string.
         let body = data_row_body(&[Some(b"42"), None, Some(b"")]);
-        let mut slots: Vec<ColSlot> = Vec::new();
-        let row = BorrowedRow::parse(&body, &mut slots).expect("well-formed row parses");
+        let mut slots = SlotsScratch::new();
+        {
+            let row = BorrowedRow::parse(&body, &mut slots).expect("well-formed row parses");
 
-        assert_eq!(row.len(), 3);
-        assert!(!row.is_empty());
-        // Positional raw + typed decode share `Row`'s exact classification.
-        assert_eq!(row.get_raw(0), Ok(Some(&b"42"[..])));
-        assert_eq!(row.get::<i32>(0), Ok(Some(42)));
-        assert_eq!(row.get_str(0), Ok(Some("42")));
-        // SQL NULL is `Ok(None)`, distinct from out-of-range, and `is_null` true.
-        assert_eq!(row.get_raw(1), Ok(None));
-        assert_eq!(row.get::<i32>(1), Ok(None));
-        assert!(row.is_null(1));
-        // Empty string is a present zero-length value, NOT a NULL.
-        assert_eq!(row.get_raw(2), Ok(Some(&b""[..])));
-        assert_eq!(row.get_str(2), Ok(Some("")));
-        assert!(!row.is_null(2));
-        // Out-of-range is a classified error, never a fabricated NULL.
-        assert_eq!(row.get_raw(3), Err(ColumnError::OutOfRange { col: 3, n_cols: 3 }));
-        assert!(!row.is_null(3));
+            assert_eq!(row.len(), 3);
+            assert!(!row.is_empty());
+            // Positional raw + typed decode share `Row`'s exact classification.
+            assert_eq!(row.get_raw(0), Ok(Some(&b"42"[..])));
+            assert_eq!(row.get::<i32>(0), Ok(Some(42)));
+            assert_eq!(row.get_str(0), Ok(Some("42")));
+            // SQL NULL is `Ok(None)`, distinct from out-of-range, and `is_null` true.
+            assert_eq!(row.get_raw(1), Ok(None));
+            assert_eq!(row.get::<i32>(1), Ok(None));
+            assert!(row.is_null(1));
+            // Empty string is a present zero-length value, NOT a NULL.
+            assert_eq!(row.get_raw(2), Ok(Some(&b""[..])));
+            assert_eq!(row.get_str(2), Ok(Some("")));
+            assert!(!row.is_null(2));
+            // Out-of-range is a classified error, never a fabricated NULL.
+            assert_eq!(row.get_raw(3), Err(ColumnError::OutOfRange { col: 3, n_cols: 3 }));
+            assert!(!row.is_null(3));
+        }
+        assert!(!slots.is_spilled(), "3 columns must stay inline");
     }
 
     #[test]
     fn borrowed_row_reuses_scratch_across_rows() {
         // The scratch slot table is CLEARED and refilled per row — a second row of
         // a different width decodes correctly over the reused buffer.
-        let mut slots: Vec<ColSlot> = Vec::new();
+        let mut slots = SlotsScratch::new();
         let first = data_row_body(&[Some(b"a"), Some(b"bb")]);
         {
             let row = BorrowedRow::parse(&first, &mut slots).expect("row 1 parses");
@@ -1143,7 +1270,7 @@ mod tests {
     fn borrowed_row_rejects_a_truncated_body() {
         // A length prefix claiming more bytes than remain is a classified decode
         // error (propagated from the reused `DataRowRef` walker), never a panic.
-        let mut slots: Vec<ColSlot> = Vec::new();
+        let mut slots = SlotsScratch::new();
         let mut body = 1_i16.to_be_bytes().to_vec();
         body.extend_from_slice(&10_i32.to_be_bytes()); // claims 10 bytes …
         body.extend_from_slice(b"xy"); // … but only 2 remain
@@ -1151,10 +1278,50 @@ mod tests {
     }
 
     #[test]
+    fn slots_scratch_stays_inline_up_to_16_columns() {
+        let cols: Vec<Option<&[u8]>> = (0..16).map(|_| Some(&b"val"[..])).collect();
+        let body = data_row_body(&cols);
+        let mut slots = SlotsScratch::new();
+        {
+            let row = BorrowedRow::parse(&body, &mut slots).expect("16-col row parses");
+            assert_eq!(row.len(), 16);
+        }
+        assert!(!slots.is_spilled(), "16 columns must remain inline with 0 heap alloc");
+    }
+
+    #[test]
+    fn slots_scratch_spills_and_reuses_capacity_above_16_columns() {
+        let cols: Vec<Option<&[u8]>> = (0..20).map(|_| Some(&b"val"[..])).collect();
+        let body = data_row_body(&cols);
+        let mut slots = SlotsScratch::new();
+        {
+            let row1 = BorrowedRow::parse(&body, &mut slots).expect("20-col row parses");
+            assert_eq!(row1.len(), 20);
+        }
+        assert!(slots.is_spilled(), "20 columns must spill to heap");
+
+        // Second parse over same scratch reuses heap capacity without reallocating
+        {
+            let row2 = BorrowedRow::parse(&body, &mut slots).expect("row 2 parses");
+            assert_eq!(row2.len(), 20);
+        }
+        assert!(slots.is_spilled());
+    }
+
+    #[test]
     fn arena_builder_rejects_too_many_columns() {
         // A column count beyond u16 cannot be addressed by the slot index; the
         // builder must fail loud at finish(), never saturate and mis-index.
         let ab = ArenaBuilder::new(usize::from(u16::MAX) + 1);
+        assert_eq!(ab.finish().map(|_| ()), Err(ArenaSealError::TooLarge));
+    }
+
+    #[test]
+    fn arena_builder_overflow_flag_rejects_finish() {
+        let mut ab = ArenaBuilder::new(1);
+        ab.overflow = true;
+        ab.push_null();
+        ab.end_row();
         assert_eq!(ab.finish().map(|_| ()), Err(ArenaSealError::TooLarge));
     }
 

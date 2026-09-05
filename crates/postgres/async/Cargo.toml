@@ -3,7 +3,7 @@ name = "bsql-postgres-async"
 version.workspace = true
 edition = "2024"
 rust-version = "1.95"
-description = "Async PostgreSQL driver built on bsql-pg-proto sans-IO state machine"
+description = "Async PostgreSQL driver built on bsql-postgres-proto sans-IO state machine"
 license = "MIT OR Apache-2.0"
 repository.workspace = true
 

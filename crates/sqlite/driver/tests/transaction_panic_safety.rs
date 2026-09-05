@@ -39,13 +39,13 @@ fn count(conn: &Connection, table: &str) -> i64 {
 /// connection at a CLEAN boundary (reusable), and persists nothing.
 #[test]
 fn a_panicking_closure_rolls_back_and_leaves_the_connection_reusable() {
-    let conn = Connection::open_in_memory().expect("open in-memory");
+    let mut conn = Connection::open_in_memory().expect("open in-memory");
     conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .expect("create t");
 
     // The closure inserts a row (inside the open BEGIN) then PANICS. The panic
     // propagates out of `transaction` — caught here so the test process survives.
-    // `AssertUnwindSafe`: `&Connection` wraps rusqlite's interior mutability and is
+    // `AssertUnwindSafe`: `&mut Connection` wraps rusqlite's interior mutability and is
     // not `RefUnwindSafe`; the assertion is sound because we OBSERVE the connection
     // only through its public verbs afterward (we never read logically-torn state).
     let caught = catch_unwind(AssertUnwindSafe(|| {
@@ -91,7 +91,7 @@ fn a_panicking_closure_rolls_back_and_leaves_the_connection_reusable() {
 /// path is byte-for-byte the prior behaviour.
 #[test]
 fn a_normal_commit_still_commits() {
-    let conn = Connection::open_in_memory().expect("open in-memory");
+    let mut conn = Connection::open_in_memory().expect("open in-memory");
     conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .expect("create t");
 
@@ -111,7 +111,7 @@ fn a_normal_commit_still_commits() {
 /// guard never double-rolls-back nor re-wraps the error.
 #[test]
 fn a_normal_error_still_rolls_back_with_its_exact_classified_error() {
-    let conn = Connection::open_in_memory().expect("open in-memory");
+    let mut conn = Connection::open_in_memory().expect("open in-memory");
     conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .expect("create t");
 

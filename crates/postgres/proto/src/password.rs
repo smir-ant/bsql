@@ -360,7 +360,7 @@ pub enum Credentials {
     ///
     /// **Security**: cleartext password is sent as-is over the wire.
     /// The connection MUST be TLS-protected before the startup phase
-    /// begins, otherwise the password leaks. `bsql-pg-proto` itself
+    /// begins, otherwise the password leaks. `bsql-postgres-proto` itself
     /// does not enforce the TLS gate; the driver wrapper is responsible
     /// for refusing cleartext-credential constructs on non-TLS
     /// connections.

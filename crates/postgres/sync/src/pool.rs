@@ -110,6 +110,63 @@ pub struct Pool {
     inner: Arc<PoolInner>,
 }
 
+/// Rate-limits concurrent new-connection handshakes in the sync pool.
+///
+/// When a pool is cold or recovering from an outage, establishing many connections
+/// simultaneously saturates the server with TLS handshakes and SCRAM PBKDF2 compute.
+/// This limiter bounds concurrent dials to `limit`. Waiters block on `condvar`
+/// until an in-flight handshake finishes (or their checkout deadline expires).
+struct HandshakeLimiter {
+    state: Mutex<usize>,
+    condvar: Condvar,
+    limit: usize,
+}
+
+impl HandshakeLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(0),
+            condvar: Condvar::new(),
+            limit: limit.max(1),
+        }
+    }
+
+    fn acquire<'a>(&'a self, deadline: Instant) -> Result<HandshakeGuard<'a>, DriverError> {
+        #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+        let mut active = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if *active < self.limit {
+                *active = active.saturating_add(1);
+                return Ok(HandshakeGuard { limiter: self });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(DriverError::PoolTimeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            #[allow(clippy::disallowed_methods, reason = "condvar poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+            let (recovered, _) = self
+                .condvar
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            active = recovered;
+        }
+    }
+}
+
+struct HandshakeGuard<'a> {
+    limiter: &'a HandshakeLimiter,
+}
+
+impl Drop for HandshakeGuard<'_> {
+    fn drop(&mut self) {
+        #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+        let mut active = self.limiter.state.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        self.limiter.condvar.notify_one();
+    }
+}
+
 struct PoolInner {
     config: ConnectConfig,
     state: Mutex<PoolState>,
@@ -136,6 +193,11 @@ struct PoolInner {
     /// `None` (disabled). At checkout, a connection idle longer than this is
     /// reaped and replaced. Fixed for the pool's life.
     idle_timeout: Option<Duration>,
+    /// Thundering-herd gate: bounds how many threads can dial new connections
+    /// concurrently during pool warmup or post-outage recovery.
+    handshake_limiter: HandshakeLimiter,
+    /// Condvar notified when all in-flight checkouts are returned during graceful drain.
+    drain_condvar: Condvar,
 }
 
 struct PoolState {
@@ -145,6 +207,8 @@ struct PoolState {
     /// (identified by `Arc` pointer). The FRONT is the next to serve; a freed
     /// slot wakes exactly it. Empty on the uncontended path.
     waiters: VecDeque<Arc<Condvar>>,
+    /// Set when [`Pool::drain`] starts, preventing new checkouts and waking existing waiters.
+    draining: bool,
 }
 
 impl std::fmt::Debug for Pool {
@@ -230,7 +294,15 @@ impl Pool {
         acquire_timeout: Duration,
     ) -> Self {
         // `None`/`None`: no lifetime/idle reaping by default (existing behaviour).
-        Self::from_parts(config, max_size, acquire_timeout, Diagnostics::default(), None, None)
+        Self::from_parts(
+            config,
+            max_size,
+            acquire_timeout,
+            Diagnostics::default(),
+            None,
+            None,
+            None,
+        )
     }
 
     /// Start building a pool with structured diagnostics (a
@@ -249,6 +321,7 @@ impl Pool {
             diagnostics: Diagnostics::default(),
             max_lifetime: None,
             idle_timeout: None,
+            max_concurrent_handshakes: None,
         }
     }
 
@@ -261,7 +334,12 @@ impl Pool {
         diagnostics: Diagnostics,
         max_lifetime: Option<Duration>,
         idle_timeout: Option<Duration>,
+        max_concurrent_handshakes: Option<usize>,
     ) -> Self {
+        let handshake_limit = match max_concurrent_handshakes {
+            Some(m) => m,
+            None => std::cmp::min(max_size, 2).max(1),
+        };
         Self {
             inner: Arc::new(PoolInner {
                 config,
@@ -269,6 +347,7 @@ impl Pool {
                     connections: VecDeque::with_capacity(max_size),
                     checked_out: 0,
                     waiters: VecDeque::new(),
+                    draining: false,
                 }),
                 max_size,
                 acquire_timeout,
@@ -278,6 +357,8 @@ impl Pool {
                 waiters_high_water: AtomicU64::new(0),
                 max_lifetime,
                 idle_timeout,
+                handshake_limiter: HandshakeLimiter::new(handshake_limit),
+                drain_condvar: Condvar::new(),
             }),
         }
     }
@@ -316,6 +397,9 @@ impl Pool {
                 // the guarded pool state so the pool keeps operating.
                 #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
                 let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.draining {
+                    return Err(DriverError::PoolTimeout);
+                }
                 // FAST PATH: no one is queued ahead of us AND a slot is free → take
                 // it directly, with NO ticket allocation (the uncontended common
                 // case). If someone is already waiting, we MUST queue behind them
@@ -409,20 +493,49 @@ impl Pool {
                 // No reusable idle connection: create a FRESH one (already clean,
                 // no reset needed) carrying the pool's diagnostics, into the
                 // reserved slot.
-                None => match Connection::connect_with(&self.inner.config, &self.inner.diagnostics) {
-                    Ok(conn) => {
-                        return Ok(PooledConnection {
-                            conn: Some(conn),
-                            pool: self.inner.clone(),
-                            // Birth time of a freshly-established connection.
-                            created: Instant::now(),
-                        });
-                    }
-                    Err(e) => {
+                None => {
+                    // Thundering-herd gate: rate-limit concurrent connection dials.
+                    // Only up to `max_concurrent_handshakes` threads establish connections
+                    // simultaneously. Remaining threads wait here.
+                    let handshake = match self.inner.handshake_limiter.acquire(deadline) {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            self.release_slot();
+                            return Err(e);
+                        }
+                    };
+
+                    // Double-check the idle queue! While waiting for the handshake permit,
+                    // an earlier concurrent connection may have finished its query and
+                    // returned to the idle set. If so, release our reservation and loop to reuse it.
+                    let has_idle = {
+                        #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+                        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        !state.connections.is_empty()
+                    };
+                    if has_idle {
+                        drop(handshake);
                         self.release_slot();
-                        return Err(e);
+                        continue;
                     }
-                },
+
+                    match Connection::connect_with(&self.inner.config, &self.inner.diagnostics) {
+                        Ok(conn) => {
+                            drop(handshake);
+                            return Ok(PooledConnection {
+                                conn: Some(conn),
+                                pool: self.inner.clone(),
+                                // Birth time of a freshly-established connection.
+                                created: Instant::now(),
+                            });
+                        }
+                        Err(e) => {
+                            drop(handshake);
+                            self.release_slot();
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
     }
@@ -452,6 +565,11 @@ impl Pool {
             self.inner.waiters_high_water.fetch_max(depth, Ordering::Relaxed);
         }
         loop {
+            if state.draining {
+                remove_ticket(&mut state, &ticket);
+                wake_front(&state);
+                return Err(DriverError::PoolTimeout);
+            }
             // Serve ONLY when we are the front — never barge past an earlier
             // waiter even if a slot is momentarily free.
             if state.waiters.front().is_some_and(|w| Arc::ptr_eq(w, &ticket))
@@ -515,6 +633,9 @@ impl Pool {
             Some(n) => state.checked_out = n,
             None => debug_assert!(false, "pool checked_out underflow on slot release"),
         }
+        if state.checked_out == 0 && state.draining {
+            self.inner.drain_condvar.notify_all();
+        }
         // Freeing this slot may let the front waiter proceed — wake exactly it.
         wake_front(&state);
     }
@@ -546,6 +667,45 @@ impl Pool {
             self.inner.connections_evicted.load(Ordering::Relaxed),
             self.inner.waiters_high_water.load(Ordering::Relaxed),
         )
+    }
+
+    /// Gracefully drain the pool: wait for all in-flight checkouts to finish and
+    /// return their connections, then gracefully terminate all connections with
+    /// [`close_graceful`](Connection::close_graceful).
+    ///
+    /// Unlike [`close`](Self::close) which only closes connections currently idle,
+    /// `drain` acts as a complete barrier: it blocks until all checked out connections
+    /// are returned, ensuring zero in-flight operations are abandoned.
+    ///
+    /// # Consumes the pool (use-after-drain is a COMPILE error)
+    ///
+    /// `drain` takes `self` by value, making use-after-drain statically impossible:
+    ///
+    /// ```compile_fail
+    /// # fn demo(pool: bsql_postgres_sync::Pool) {
+    /// pool.drain();
+    /// pool.get().unwrap();   // ERROR[E0382]: `pool` was moved into `drain`
+    /// # }
+    /// ```
+    pub fn drain(self) {
+        {
+            #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.draining = true;
+            for waiter in &state.waiters {
+                waiter.notify_one();
+            }
+            while state.checked_out > 0 {
+                #[allow(clippy::disallowed_methods, reason = "condvar poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+                let recovered = self
+                    .inner
+                    .drain_condvar
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = recovered;
+            }
+        }
+        self.close();
     }
 
     /// GRACEFULLY DRAIN the pool: send a protocol `Terminate` to every
@@ -611,6 +771,7 @@ pub struct PoolBuilder {
     diagnostics: Diagnostics,
     max_lifetime: Option<Duration>,
     idle_timeout: Option<Duration>,
+    max_concurrent_handshakes: Option<usize>,
 }
 
 impl PoolBuilder {
@@ -618,6 +779,17 @@ impl PoolBuilder {
     /// [`Pool::get_timeout`]). Defaults to 30s.
     pub fn acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
         self.acquire_timeout = acquire_timeout;
+        self
+    }
+
+    /// Set the maximum number of concurrent new-connection handshakes allowed.
+    ///
+    /// When the pool is cold or recovering from an outage, this bounds how many
+    /// threads can simultaneously initiate TCP dials, TLS handshakes, and SCRAM
+    /// authentications against the server, protecting PostgreSQL from connection
+    /// storms / thundering herd. Defaults to `min(max_size, 2)` (at least 1).
+    pub fn max_concurrent_handshakes(mut self, max: usize) -> Self {
+        self.max_concurrent_handshakes = Some(max);
         self
     }
 
@@ -678,6 +850,7 @@ impl PoolBuilder {
             self.diagnostics,
             self.max_lifetime,
             self.idle_timeout,
+            self.max_concurrent_handshakes,
         )
     }
 }
@@ -750,6 +923,9 @@ impl Drop for PooledConnection {
             match state.checked_out.checked_sub(1) {
                 Some(n) => state.checked_out = n,
                 None => debug_assert!(false, "pool checked_out underflow on connection return"),
+            }
+            if state.checked_out == 0 && state.draining {
+                self.pool.drain_condvar.notify_all();
             }
             if conn.is_healthy() {
                 // Restamp `returned` for `idle_timeout` — but read the clock ONLY
@@ -884,5 +1060,70 @@ mod reaper_tests {
         // idle_timeout = time since `returned`.
         assert!(is_stale(now, birth, now, None, Some(Duration::from_secs(5))));
         assert!(!is_stale(now, birth, now, None, Some(Duration::from_secs(50))));
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn handshake_limiter_bounds_concurrency() {
+        let limiter = Arc::new(HandshakeLimiter::new(2));
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_seen = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..6 {
+            let l = Arc::clone(&limiter);
+            let active = Arc::clone(&active_count);
+            let max_seen = Arc::clone(&max_concurrent_seen);
+            handles.push(thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let guard = l.acquire(deadline).expect("acquire permit");
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(cur, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(20));
+                active.fetch_sub(1, Ordering::SeqCst);
+                drop(guard);
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("join thread");
+        }
+
+        assert!(
+            max_concurrent_seen.load(Ordering::SeqCst) <= 2,
+            "concurrent handshakes must never exceed the configured limit of 2"
+        );
+    }
+
+    #[test]
+    fn handshake_limiter_times_out() {
+        let limiter = HandshakeLimiter::new(1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let guard = limiter.acquire(deadline).expect("first acquire succeeds");
+
+        let short_deadline = Instant::now() + Duration::from_millis(20);
+        let result = limiter.acquire(short_deadline);
+        assert!(matches!(result, Err(DriverError::PoolTimeout)));
+        drop(guard);
+
+        // After dropping, acquisition succeeds again:
+        let result = limiter.acquire(Instant::now() + Duration::from_secs(1));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn empty_pool_drain_completes() {
+        let pool = Pool::new(
+            ConnectConfig::new("127.0.0.1", "postgres").database("postgres".to_string()),
+            5,
+        );
+        pool.drain();
     }
 }

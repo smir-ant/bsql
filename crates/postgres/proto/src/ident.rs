@@ -161,7 +161,7 @@ pub const MAX_PG_NAME_LEN: usize = 63;
 /// `try_from_str` with its own tag. The set of tags would be tier-4
 /// in practice ("users happen not to") rather than tier-1 compile.
 /// The sealed supertrait closes this hole: only types defined inside
-/// `bsql-pg-proto` can ever be valid tags.
+/// `bsql-postgres-proto` can ever be valid tags.
 mod sealed {
     /// Supertrait seal for [`super::FixedStrKind`]. Can only be
     /// impl'd from within the `ident` module.

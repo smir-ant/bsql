@@ -1786,7 +1786,7 @@ fn check_bare_column_alias(
     if as_marks.contains(&(start.line, start.column)) {
         return Ok(());
     }
-    let lower = alias.value.to_ascii_lowercase();
+    let lower = alias.value.to_lowercase();
     // A bare trailing `isnull` is NOT an alias: PostgreSQL reinterprets it as the
     // `IS NULL` POSTFIX OPERATOR (a boolean), exactly as it does the sibling
     // `notnull` (which the parser already yields as `IS NOT NULL`). The engine
@@ -10462,7 +10462,7 @@ fn reject_reserved_keyword_alias(ident: &Ident, position: &str) -> Result<(), In
     if ident.quote_style.is_some() {
         return Ok(());
     }
-    let lower = ident.value.to_ascii_lowercase();
+    let lower = ident.value.to_lowercase();
     if is_reserved_keyword(&lower) {
         return Err(InferError::ReservedKeywordAlias {
             keyword: lower,
@@ -11848,7 +11848,7 @@ fn function_name(func: &sqlparser::ast::Function) -> Option<String> {
         .0
         .last()
         .and_then(|p| p.as_ident())
-        .map(|i| i.value.to_ascii_lowercase())
+        .map(|i| i.value.to_lowercase())
 }
 
 /// The single positional argument expression of a function call, if it has

@@ -217,6 +217,29 @@ impl SendBuf {
         self.sent == self.buf.len()
     }
 
+    /// Begin a new `CopyData` ('d') frame: appends the `'d'` message tag followed by
+    /// a 4-byte placeholder for the self-inclusive length.
+    /// Returns the buffer offset where the 4-byte length prefix begins.
+    #[inline]
+    pub fn begin_copy_frame(&mut self) -> usize {
+        self.buf.push(crate::wire::TAG_COPY_DATA.byte());
+        let offset = self.buf.len();
+        self.buf.extend_from_slice(&[0, 0, 0, 0]);
+        offset
+    }
+
+    /// Seal an active `CopyData` frame started at `len_offset`: back-patches the
+    /// self-inclusive 4-byte length (counting the 4 length bytes plus all body bytes).
+    #[inline]
+    pub fn seal_copy_frame(&mut self, len_offset: usize) -> Result<(), WriteBufFull> {
+        let len = self.buf.len().saturating_sub(len_offset);
+        let len_u32 = u32::try_from(len).map_err(|_| WriteBufFull)?;
+        let end = len_offset.checked_add(4).ok_or(WriteBufFull)?;
+        let slot = self.buf.get_mut(len_offset..end).ok_or(WriteBufFull)?;
+        slot.copy_from_slice(&len_u32.to_be_bytes());
+        Ok(())
+    }
+
     /// The whole queued region (`buf[..len]`), independent of the send cursor —
     /// the bytes physically resident in the live part of the backing store.
     ///

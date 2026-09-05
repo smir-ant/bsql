@@ -100,3 +100,86 @@ fn a_transaction_panicking_before_its_first_verb_leaves_no_armed_begin() {
     assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
     assert_eq!(result.command_tag().to_string(), "SELECT 1");
 }
+
+fn simple_command_reply(cmd: &str, tx_status: u8) -> QueryReply {
+    let simple = wire::concat(&[
+        wire::command_complete(cmd).expect("command complete"),
+        wire::ready_for_query(tx_status).expect("ready for query"),
+    ]);
+    QueryReply {
+        simple,
+        extended: Vec::new(),
+        row_description: Vec::new(),
+    }
+}
+
+fn select_val_reply(val: i64, tag: &str, tx_status: u8) -> QueryReply {
+    let simple = wire::concat(&[
+        wire::row_description(&[("val".to_owned(), OID_INT8)]).expect("row description"),
+        wire::data_row(&[Some(val.to_string().into_bytes())]).expect("data row"),
+        wire::command_complete(tag).expect("command complete"),
+        wire::ready_for_query(tx_status).expect("ready for query"),
+    ]);
+    let extended = wire::concat(&[
+        wire::data_row(&[Some(wire::binary_int8(val))]).expect("data row"),
+        wire::command_complete(tag).expect("command complete"),
+    ]);
+    let row_description =
+        wire::row_description(&[("val".to_owned(), OID_INT8)]).expect("row description");
+    QueryReply { simple, extended, row_description }
+}
+
+fn script_with_rollback() -> FakeScript {
+    FakeScript {
+        handshake: handshake(),
+        queries: vec![
+            ("BEGIN".to_owned(), simple_command_reply("BEGIN", b'T')),
+            ("SELECT 10".to_owned(), select_val_reply(10, "SELECT 10", b'T')),
+            ("ROLLBACK".to_owned(), simple_command_reply("ROLLBACK", TX_IDLE)),
+            ("SELECT 20".to_owned(), select_val_reply(20, "SELECT 20", TX_IDLE)),
+        ],
+        unmatched_simple: wire::concat(&[
+            wire::error_response("ERROR", "XX000", "no scripted reply").expect("error response"),
+            wire::ready_for_query(TX_IDLE).expect("ready for query"),
+        ]),
+        unmatched_extended: wire::error_response("ERROR", "XX000", "no scripted reply")
+            .expect("error response"),
+        parse_complete: wire::parse_complete().expect("parse complete"),
+        bind_complete: wire::bind_complete().expect("bind complete"),
+        close_complete: wire::close_complete().expect("close complete"),
+        unsupported_error: wire::error_response("ERROR", "0A000", "extended protocol unsupported")
+            .expect("error response"),
+        ready_for_query: wire::ready_for_query(TX_IDLE).expect("ready for query"),
+    }
+}
+
+#[test]
+fn a_transaction_panicking_after_its_first_verb_rolls_back_synchronously_on_drop() {
+    let mut conn = Connection::connect_fake(FakeTransport::new(script_with_rollback()))
+        .expect("connect over the in-memory fake");
+
+    let prior_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        conn.transaction(|tx| -> Result<(), DriverError> {
+            let res = tx.query_raw("SELECT 10")?;
+            assert_eq!(res.len(), 1);
+            panic!("boom after first verb inside tx");
+        })
+    }));
+    std::panic::set_hook(prior_hook);
+    assert!(outcome.is_err(), "the body panic must propagate out of transaction()");
+
+    // Verify connection state after panic unwinding:
+    assert!(!conn.tx_needs_rollback(), "sync Drop cleared tx_needs_rollback");
+    assert_eq!(conn.tx_status(), Some(bsql_postgres_sync::TxStatus::Idle));
+    assert!(conn.is_healthy());
+
+    // Subsequent command on reused connection succeeds cleanly:
+    let result = conn
+        .query_raw("SELECT 20")
+        .expect("connection is cleanly reusable after panic rollback");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(20)));
+}
+

@@ -139,6 +139,9 @@ struct PoolInner {
     /// `None` (disabled). At checkout, a connection idle longer than this is
     /// reaped and replaced. Fixed for the pool's life.
     idle_timeout: Option<Duration>,
+    /// Thundering-herd gate: rate-limits concurrent new connection handshakes
+    /// when the pool is cold or recovering from a server outage.
+    handshake_semaphore: Arc<Semaphore>,
 }
 
 /// A cancellation-safe bracket around the semaphore acquire: it bumps the pool's
@@ -202,8 +205,17 @@ impl Pool {
         max_size: usize,
         acquire_timeout: Duration,
     ) -> Self {
+        let default_handshake_limit = std::cmp::min(max_size, 2).max(1);
         // `None`/`None`: no lifetime/idle reaping by default (existing behaviour).
-        Self::from_parts(config, max_size, acquire_timeout, Diagnostics::default(), None, None)
+        Self::from_parts(
+            config,
+            max_size,
+            acquire_timeout,
+            Diagnostics::default(),
+            None,
+            None,
+            default_handshake_limit,
+        )
     }
 
     /// Start building a pool with structured diagnostics (a
@@ -234,6 +246,7 @@ impl Pool {
             diagnostics: Diagnostics::default(),
             max_lifetime: None,
             idle_timeout: None,
+            max_concurrent_handshakes: None,
         }
     }
 
@@ -246,12 +259,15 @@ impl Pool {
         diagnostics: Diagnostics,
         max_lifetime: Option<Duration>,
         idle_timeout: Option<Duration>,
+        max_concurrent_handshakes: usize,
     ) -> Self {
+        let handshake_limit = max_concurrent_handshakes.clamp(1, max_size.max(1));
         Self {
             inner: Arc::new(PoolInner {
                 config,
                 connections: Mutex::new(VecDeque::with_capacity(max_size)),
                 semaphore: Arc::new(Semaphore::new(max_size)),
+                handshake_semaphore: Arc::new(Semaphore::new(handshake_limit)),
                 max_size,
                 acquire_timeout,
                 diagnostics,
@@ -430,23 +446,50 @@ impl Pool {
                 // no reset needed) carrying the pool's diagnostics. It rides the
                 // permit already held; a connect failure drops the permit
                 // (returning capacity) on the way out.
-                None => match Connection::connect_with(
-                    &self.inner.config,
-                    &self.inner.diagnostics,
-                )
-                .await
-                {
-                    Ok(conn) => {
-                        return Ok(PooledConnection {
-                            conn: Some(conn),
-                            pool: Arc::clone(&self.inner),
-                            permit,
-                            // Birth time of a freshly-established connection.
-                            created: Instant::now(),
-                        });
+                None => {
+                    // Thundering-herd gate: rate-limit concurrent connection dials.
+                    // Only up to `max_concurrent_handshakes` tasks establish connections
+                    // simultaneously. Remaining tasks wait here.
+                    let _handshake = match self.inner.handshake_semaphore.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return Err(DriverError::PoolTimeout),
+                    };
+
+                    // Double-check the idle queue! While waiting for the handshake permit,
+                    // an earlier concurrent connection may have finished its query and
+                    // returned to the idle set. If so, restart the loop to take it!
+                    let has_idle = {
+                        #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+                        let conns = self.inner.connections.lock().unwrap_or_else(|e| e.into_inner());
+                        !conns.is_empty()
+                    };
+                    if has_idle {
+                        drop(_handshake);
+                        continue;
                     }
-                    Err(e) => return Err(e),
-                },
+
+                    match Connection::connect_with(
+                        &self.inner.config,
+                        &self.inner.diagnostics,
+                    )
+                    .await
+                    {
+                        Ok(conn) => {
+                            drop(_handshake);
+                            return Ok(PooledConnection {
+                                conn: Some(conn),
+                                pool: Arc::clone(&self.inner),
+                                permit,
+                                // Birth time of a freshly-established connection.
+                                created: Instant::now(),
+                            });
+                        }
+                        Err(e) => {
+                            drop(_handshake);
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
     }
@@ -534,6 +577,34 @@ impl Pool {
             conn.close_graceful().await;
         }
     }
+
+    /// Gracefully drain the pool: wait for all in-flight checkouts to finish and
+    /// return their connections, then gracefully terminate all connections with
+    /// [`close_graceful`](Connection::close_graceful).
+    ///
+    /// Unlike [`close`](Self::close) which only closes connections currently idle,
+    /// `drain` acts as a complete barrier: it blocks until all permits are returned,
+    /// ensuring zero in-flight operations are abandoned.
+    ///
+    /// # Consumes the pool (use-after-drain is a COMPILE error)
+    ///
+    /// `drain` takes `self` by value, making use-after-drain statically impossible:
+    ///
+    /// ```compile_fail
+    /// # async fn demo(pool: bsql_postgres_async::Pool) {
+    /// pool.drain().await;
+    /// pool.get().await.unwrap();   // ERROR[E0382]: `pool` was moved into `drain`
+    /// # }
+    /// ```
+    pub async fn drain(self) {
+        #[allow(clippy::disallowed_methods, reason = "saturating ceiling on permit count for non-32-bit targets; self.inner.max_size is <= u32::MAX in practice")]
+        let permits = u32::try_from(self.inner.max_size).unwrap_or(u32::MAX);
+        let sem = Arc::clone(&self.inner.semaphore);
+        if let Ok(all_permits) = sem.acquire_many(permits).await {
+            drop(all_permits);
+            self.close().await;
+        }
+    }
 }
 
 /// A builder for a [`Pool`] with an acquire deadline and structured diagnostics.
@@ -550,6 +621,7 @@ pub struct PoolBuilder {
     diagnostics: Diagnostics,
     max_lifetime: Option<Duration>,
     idle_timeout: Option<Duration>,
+    max_concurrent_handshakes: Option<usize>,
 }
 
 impl PoolBuilder {
@@ -557,6 +629,17 @@ impl PoolBuilder {
     /// [`Pool::get_timeout`]). Defaults to 30s.
     pub fn acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
         self.acquire_timeout = acquire_timeout;
+        self
+    }
+
+    /// Set the maximum number of concurrent new-connection handshakes allowed.
+    ///
+    /// When the pool is cold or recovering from an outage, this bounds how many
+    /// tasks can simultaneously initiate TCP dials, TLS handshakes, and SCRAM
+    /// authentications against the server, protecting PostgreSQL from connection
+    /// storms / thundering herd. Defaults to `min(max_size, 2)` (at least 1).
+    pub fn max_concurrent_handshakes(mut self, max: usize) -> Self {
+        self.max_concurrent_handshakes = Some(max);
         self
     }
 
@@ -612,6 +695,10 @@ impl PoolBuilder {
     /// [`Pool::get`].
     #[must_use]
     pub fn build(self) -> Pool {
+        let max_handshakes = match self.max_concurrent_handshakes {
+            Some(m) => m,
+            None => std::cmp::min(self.max_size, 2).max(1),
+        };
         Pool::from_parts(
             self.config,
             self.max_size,
@@ -619,6 +706,7 @@ impl PoolBuilder {
             self.diagnostics,
             self.max_lifetime,
             self.idle_timeout,
+            max_handshakes,
         )
     }
 }
@@ -747,5 +835,31 @@ mod reaper_tests {
         // idle_timeout = time since `returned`.
         assert!(is_stale(now, birth, now, None, Some(Duration::from_secs(5))));
         assert!(!is_stale(now, birth, now, None, Some(Duration::from_secs(50))));
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_pool_drain_completes() {
+        let pool = Pool::new(
+            ConnectConfig::new("127.0.0.1", "postgres").database("postgres".to_string()),
+            5,
+        );
+        pool.drain().await;
+    }
+
+    #[test]
+    fn builder_sets_max_concurrent_handshakes() {
+        let pool = Pool::builder(
+            ConnectConfig::new("127.0.0.1", "postgres").database("postgres".to_string()),
+            10,
+        )
+        .max_concurrent_handshakes(4)
+        .build();
+
+        assert_eq!(pool.inner.handshake_semaphore.available_permits(), 4);
     }
 }

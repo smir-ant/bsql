@@ -277,7 +277,7 @@ fn null_in_non_null_field_is_classified() {
 
 #[test]
 fn typed_query_binds_params_and_runs_in_a_transaction() {
-    let conn = Connection::open_in_memory().expect("open");
+    let mut conn = Connection::open_in_memory().expect("open");
     seed_cells(&conn);
 
     // A `$1` parameter binds by position; a positive filter selects one row.

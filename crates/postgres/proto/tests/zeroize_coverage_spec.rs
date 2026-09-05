@@ -2,7 +2,7 @@
 //!
 //! # Tier-1-by-construction promise
 //!
-//! Every type in `bsql-pg-proto` that derives `zeroize::ZeroizeOnDrop`
+//! Every type in `bsql-postgres-proto` that derives `zeroize::ZeroizeOnDrop`
 //! (or carries a manual `impl Drop` whose body calls `.zeroize()`)
 //! MUST appear in the [`crate::drop_witness::CrateZeroizeSecret`]
 //! manifest at `src/drop_witness.rs`. This test parses the source

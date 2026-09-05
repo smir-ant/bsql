@@ -23,6 +23,8 @@
 mod engine_active_spec;
 #[path = "offline_specs/engine_close_many.rs"]
 mod engine_close_many;
+#[path = "offline_specs/engine_copy_aggregated_spec.rs"]
+mod engine_copy_aggregated_spec;
 #[path = "offline_specs/engine_copy_batch.rs"]
 mod engine_copy_batch;
 #[path = "offline_specs/engine_flush_cancel.rs"]

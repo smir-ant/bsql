@@ -54,6 +54,11 @@ categories = ["database", "development-tools::build-utils"]
 # graph. So the shipped, runtime-linked artifact is byte-for-byte unchanged.
 sqlparser = { workspace = true, features = ["recursive-protection"] }
 
+# `sha2` — deterministic cryptographic SHA-256 schema fingerprinting.
+# BUILD-TIME ONLY. Zero unsafe, same vetted workspace dependency.
+sha2 = { workspace = true }
+
+
 # `rusqlite` — safe Rust bindings to SQLite, BUILD-TIME ONLY and OPTIONAL
 # (behind the `sqlite` feature). When a consumer also targets SQLite, this
 # crate replays the consumer's migration DDL into an in-memory/file SQLite

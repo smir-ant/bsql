@@ -54,7 +54,7 @@ use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, Diagnostics, DriverError,
     Endpoint, MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification,
-    Pipeline, QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
+    Pipeline, QueryResult, Redial, Row, Rows, SslMode, TxStatus, TypedNotification,
 };
 // Referenced only by the non-unix `Endpoint::Unix` reject arm in `build_wire`.
 #[cfg(not(unix))]
@@ -355,7 +355,7 @@ impl Connection {
             .map_err(|_| DriverError::NotReady)?
             .map(str::to_owned);
 
-        let redial = Redial::from_config(config);
+        let redial = Redial::from_config(config, encrypted);
         let mut core = Core::new(engine, live, encrypted, server_version, backend_pid, secret_key);
         // Install the dropped-future recovery cancel hook: if a verb future is
         // dropped mid-command (a `tokio::time::timeout` / `select!` loss), the NEXT
@@ -568,7 +568,7 @@ impl Connection {
             core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
             // The in-memory fake has no network endpoint; a nominal loopback
             // redial satisfies the field (a testkit connection is never canceled).
-            redial: Redial::from_config(&ConnectConfig::new("localhost", "")),
+            redial: Redial::from_config(&ConnectConfig::new("localhost", ""), false),
             read_deadline,
         })
     }
@@ -1247,7 +1247,9 @@ impl Connection {
                 begin_armed: false,
             };
             let outcome = f(&mut tx).await;
-            (outcome, tx.begin_armed)
+            let opened = tx.begin_armed;
+            tx.disarm();
+            (outcome, opened)
         };
         // Terminate ONLY if a verb actually opened the transaction. An empty body
         // armed no BEGIN, so there is nothing to commit or roll back — and the
@@ -1639,6 +1641,20 @@ impl Connection {
         self.core.is_healthy()
     }
 
+    /// Return the current transaction status observed from the server (`Idle`, `InTransaction`, `Failed`).
+    #[must_use]
+    #[inline]
+    pub fn tx_status(&self) -> Option<TxStatus> {
+        self.core.tx_status()
+    }
+
+    /// Whether an interrupted or cancelled transaction is pending rollback before issuing new commands.
+    #[must_use]
+    #[inline]
+    pub fn tx_needs_rollback(&self) -> bool {
+        self.core.tx_needs_rollback()
+    }
+
     /// The server version reported at connect, if recovered.
     #[must_use]
     pub fn server_version(&self) -> Option<&str> {
@@ -1757,8 +1773,7 @@ pub struct Transaction<'t> {
     /// `set_config` of `statement_timeout` issued INSIDE the transaction re-derives
     /// the window through the SAME authority the connection-level verbs use (closes
     /// the tx-guard observation gap — a transaction is a common place to bound a
-    /// long operation via `SET statement_timeout`). Borrowed for the body's scope;
-    /// the guard adds no owned state and no `Drop`.
+    /// long operation via `SET statement_timeout`). Borrowed for the body's scope.
     read_deadline: &'t Arc<ReadDeadline>,
     /// `true` once the deferred `BEGIN` has been armed by the first verb. Armed
     /// exactly once, and ONLY from within a verb's poll (never out-of-band at
@@ -1768,7 +1783,21 @@ pub struct Transaction<'t> {
     begin_armed: bool,
 }
 
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        if self.begin_armed {
+            self.core.mark_tx_needs_rollback();
+        }
+    }
+}
+
 impl Transaction<'_> {
+    /// Disarm the drop guard on normal transaction completion.
+    #[inline]
+    fn disarm(&mut self) {
+        self.begin_armed = false;
+    }
+
     /// Poll-time arm-once wrapper: arm the deferred `BEGIN` INSIDE the returned
     /// future, at the SAME poll the built verb takes the liveness token.
     ///

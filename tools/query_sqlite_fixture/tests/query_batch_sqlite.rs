@@ -53,7 +53,7 @@ fn seed() -> Connection {
 /// command with the correct DECODED values (not just counts); connection reusable.
 #[test]
 fn n_reads_return_grouped_decoded_typed_rows() {
-    let conn = seed();
+    let mut conn = seed();
     let grouped = conn
         .query_batch::<QbWeightById>(vec![(1_i64,), (2,), (3,)])
         .expect("batch runs");
@@ -73,7 +73,7 @@ fn n_reads_return_grouped_decoded_typed_rows() {
 /// `TypedRows<Q>` (the reason the return type is `Vec<TypedRows<Q>>`).
 #[test]
 fn grouping_is_preserved_per_command() {
-    let conn = seed();
+    let mut conn = seed();
     let grouped = conn
         .query_batch::<QbUpToId>(vec![(1_i64,), (2,), (3,)])
         .expect("batch runs");
@@ -88,7 +88,7 @@ fn grouping_is_preserved_per_command() {
 /// N == 0 → an empty `Vec` (an empty transaction).
 #[test]
 fn zero_is_empty() {
-    let conn = seed();
+    let mut conn = seed();
     let grouped = conn
         .query_batch::<QbWeightById>(Vec::<(i64,)>::new())
         .expect("N=0");
@@ -99,7 +99,7 @@ fn zero_is_empty() {
 /// nested BEGIN), and its grouped results flow out.
 #[test]
 fn inside_a_transaction_guard() {
-    let conn = seed();
+    let mut conn = seed();
     let grouped = conn
         .transaction(|tx| tx.query_batch::<QbWeightById>(vec![(1_i64,), (2,)]))
         .expect("guard commits");

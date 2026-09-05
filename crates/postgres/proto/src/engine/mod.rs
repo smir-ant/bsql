@@ -530,6 +530,19 @@ impl<'b, T> Engine<'b, T> {
         Live::new_in_scope()
     }
 
+    /// Whether the active engine is in the middle of a pipelined batch that has not
+    /// yet had its trailing `Sync` staged. If dropped in this state, recovery must
+    /// stage `Sync` before draining to avoid hanging forever.
+    #[doc(hidden)]
+    #[inline]
+    #[must_use]
+    pub fn is_pipelining_without_sync(&self) -> bool {
+        match &self.phase {
+            Phase::Active(active) => active.is_pipelining_without_sync(),
+            _ => false,
+        }
+    }
+
     /// Arm a fused simple-query PRELUDE to prepend to the NEXT command's flush.
     /// Today the ONE armed prelude is a deferred transaction `BEGIN`, fused with
     /// the transaction's first statement so it costs no standalone round trip.

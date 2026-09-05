@@ -10,7 +10,7 @@
 # reason = "...")]` stating the constraint that makes it safe — so each
 # fallback is either a compile error or a greppable, reasoned exception.
 #
-# `proto` and `derive` opt out at their crate root: they enforce a
+# `proto` opts out at its crate root: it enforces a
 # STRICTER, whole-crate forbid-bundle (which forbids the entire
 # unwrap/expect/panic/as/arithmetic class) and centralise the
 # `try_from(..).unwrap_or(SATURATION)` / `slice.get(..).unwrap_or(&[])`

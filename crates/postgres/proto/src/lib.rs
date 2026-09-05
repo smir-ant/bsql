@@ -1,6 +1,6 @@
 //! PostgreSQL wire-protocol primitives — pure sync, `no_std`, no allocator.
 //!
-//! `bsql-pg-proto` is the **sans-I/O** core of bsql's PostgreSQL backend.
+//! `bsql-postgres-proto` is the **sans-I/O** core of bsql's PostgreSQL backend.
 //! It contains zero I/O, zero async runtime. The same engine drives the
 //! production async wrapper (`bsql-postgres-async`), the blocking wrapper
 //! (`bsql-postgres-sync`), and test harnesses that feed bytes directly.
@@ -98,7 +98,7 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("bsql requires a 64-bit target; the footprint pins assume 64-bit pointers");
 
-// `bsql-pg-proto` is `no_std + alloc`. The engine and the connecting-phase
+// `bsql-postgres-proto` is `no_std + alloc`. The engine and the connecting-phase
 // state box large secret-bearing handshake payloads (SCRAM / MD5 / cleartext
 // password material) to keep the state enum compact; embedded targets
 // without an allocator should use Trust-auth (no Box allocated).
@@ -106,7 +106,7 @@ extern crate alloc;
 
 // **Transitive-`unsafe` audit-trust chain**.
 //
-// `bsql-pg-proto` itself uses `#![forbid(unsafe_code)]` (above). Every line
+// `bsql-postgres-proto` itself uses `#![forbid(unsafe_code)]` (above). Every line
 // of crate-internal Rust is `unsafe`-free by build-time rejection — the
 // crate's own surface contributes ZERO unsafe boundaries. The runtime
 // dependencies that contain `unsafe` blocks, ranked by audit-trust risk:
@@ -390,7 +390,7 @@ macro_rules! wire_pin {
 // 16-bit targets are unsupported.
 const _: () = assert!(
     usize::BITS >= 32,
-    "bsql-pg-proto requires a target with usize >= 32 bits. \
+    "bsql-postgres-proto requires a target with usize >= 32 bits. \
      16-bit targets are unsupported; the wire-protocol body counters \
      are u32 and several call sites infallibly widen u32 → usize.",
 );

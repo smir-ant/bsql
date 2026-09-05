@@ -9,3 +9,7 @@ note: constructor is not visible here due to private fields
    |
    | pub struct SafeIdent<'a>(&'a str);
    |                          ^^^^^^^ private field
+help: you might have meant to use the `from_static` associated function
+   |
+10 |     let _ = SafeIdent::from_static("events; DROP TABLE users --");
+   |                      +++++++++++++

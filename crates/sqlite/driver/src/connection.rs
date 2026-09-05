@@ -84,6 +84,9 @@ impl ArenaBuilder {
     /// `TEXT` cell keeps its raw bytes; validation is deferred to `get::<&str>`);
     /// integer/real values inline into the slot.
     fn push_ref(&mut self, v: rusqlite::types::ValueRef<'_>) {
+        if self.overflow {
+            return;
+        }
         match v {
             rusqlite::types::ValueRef::Null => self.slots.push(CellSlot::Null),
             rusqlite::types::ValueRef::Integer(n) => self.slots.push(CellSlot::Integer(n)),
@@ -94,16 +97,17 @@ impl ArenaBuilder {
     }
 
     /// Copy `bytes` into the arena, recording an offset/len slot. On a 32-bit
-    /// overflow (offset, length, or their sum), mark the builder and push a NULL
-    /// placeholder — `finish` fails loudly, never a saturated range that would
-    /// mis-address bytes.
+    /// overflow (offset, length, or their sum), mark the builder — `finish`
+    /// fails loudly, never a saturated range that would mis-address bytes.
     fn push_bytes(&mut self, bytes: &[u8], is_text: bool) {
+        if self.overflow {
+            return;
+        }
         let offset = u32::try_from(self.data.len()).ok();
         let len = u32::try_from(bytes.len()).ok();
         let Some((offset, len)) = offset.zip(len).filter(|(o, l)| o.checked_add(*l).is_some())
         else {
             self.overflow = true;
-            self.slots.push(CellSlot::Null);
             return;
         };
         self.data.extend_from_slice(bytes);
@@ -120,6 +124,9 @@ impl ArenaBuilder {
     /// unaddressable. A pure-integer result writes ZERO arena bytes, so the byte
     /// guard alone would miss this — the counter needs its own loud guard.
     fn end_row(&mut self) {
+        if self.overflow {
+            return;
+        }
         match self.rows.checked_add(1) {
             Some(n) => self.rows = n,
             None => self.overflow = true,
@@ -912,20 +919,34 @@ impl Connection {
         while let Some(row) = rows.next()? {
             let b =
                 builder.get_or_insert_with(|| ArenaBuilder::new(row.as_ref().column_count()));
+            if b.overflow {
+                return Err(SqliteError::ResultTooLarge);
+            }
             // `b.n_cols` is the first row's post-reprepare width (real SQLite
             // caps column counts well under `u16::MAX`, so the narrow is exact);
             // every row of one result set has that same width.
             for col in 0..usize::from(b.n_cols) {
                 b.push_ref(row.get_ref(col)?);
+                if b.overflow {
+                    return Err(SqliteError::ResultTooLarge);
+                }
             }
             b.end_row();
+            if b.overflow {
+                return Err(SqliteError::ResultTooLarge);
+            }
         }
         // `Some` = at least one row set the width; `None` = a zero-row result,
         // whose empty builder needs no width (`seal_result` reports the columns
         // from the reprepared statement). An explicit match, not `unwrap_or_*`
         // (a real empty-result arm, not a silent fallback).
         match builder {
-            Some(b) => Ok(b),
+            Some(b) => {
+                if b.overflow {
+                    return Err(SqliteError::ResultTooLarge);
+                }
+                Ok(b)
+            }
             None => Ok(ArenaBuilder::new(0)),
         }
     }
@@ -1130,7 +1151,7 @@ impl Connection {
     /// rolled back); or [`SqliteError::TransactionRollbackFailed`] if the rollback
     /// itself fails.
     pub fn pipeline<'p, B: crate::pipeline::SqlitePipeline<'p>>(
-        &self,
+        &mut self,
         batch: B,
     ) -> Result<B::Output, SqliteError> {
         self.transaction(|tx| batch.run(tx))
@@ -1168,7 +1189,7 @@ impl Connection {
     /// rolled back); or [`SqliteError::TransactionRollbackFailed`] if the rollback
     /// itself fails.
     pub fn execute_batch<'p, Q>(
-        &self,
+        &mut self,
         params: impl IntoIterator<Item = Q::Params<'p>>,
     ) -> Result<Vec<u64>, SqliteError>
     where
@@ -1204,7 +1225,7 @@ impl Connection {
     /// rolled back); or [`SqliteError::TransactionRollbackFailed`] if the rollback
     /// itself fails.
     pub fn query_batch<'p, Q>(
-        &self,
+        &mut self,
         params: impl IntoIterator<Item = Q::Params<'p>>,
     ) -> Result<Vec<TypedRows<Q>>, SqliteError>
     where
@@ -1448,8 +1469,13 @@ impl Connection {
     }
 
     /// Begin a transaction.
+    ///
+    /// Acquires a RESERVED lock immediately via `BEGIN IMMEDIATE`.
+    /// In WAL mode, concurrent readers proceed unblocked, but concurrent write
+    /// transactions wait up to `busy_timeout` rather than deadlocking with
+    /// `SQLITE_BUSY_SNAPSHOT` mid-transaction during a deferred upgrade.
     pub fn begin(&self) -> Result<(), SqliteError> {
-        self.inner.execute_batch("BEGIN")?;
+        self.inner.execute_batch("BEGIN IMMEDIATE")?;
         Ok(())
     }
 
@@ -1484,10 +1510,10 @@ impl Connection {
     /// The transaction boundary IS the closure scope — tier-1, enforced by the
     /// type the closure is handed.
     ///
-    /// (The guard is a `&Connection` borrow; a body that DELIBERATELY captures
-    /// the outer `Connection` and re-enters `transaction` on it is out of scope —
-    /// this closes the ergonomic nesting misuse, not a hand-rolled bypass, and
-    /// matches the PostgreSQL driver's transaction guard exactly.)
+    /// The closure exclusively borrows `&mut Connection`: a body attempting to
+    /// capture the outer `Connection` and re-enter `transaction` or issue queries
+    /// on it is statically rejected by the borrow checker at compile time (E0500 / E0502),
+    /// matching the PostgreSQL driver's invariant guarantees.
     ///
     /// PANIC-SAFE: the COMMIT/ROLLBACK obligation is bound to SCOPE DESTRUCTION
     /// (a hand-rolled RAII [`TxRollbackGuard`]), not to the closure's RETURN
@@ -1499,17 +1525,16 @@ impl Connection {
     /// The normal Ok/Err paths `disarm()` the guard before their explicit
     /// terminator, so their precise classified [`SqliteError`] is unchanged.
     ///
-    /// The `BEGIN` is DEFERRED (not `BEGIN IMMEDIATE`) BY DESIGN: a deferred
-    /// begin preserves read concurrency, and a read-then-write lock upgrade that
-    /// contends is already fail-loud (a classified [`SqliteError`] with
-    /// [`is_busy`](SqliteError::is_busy) `true`) and bounded by the 5 s
-    /// `busy_timeout` — so there is nothing to "fix" by upgrading to IMMEDIATE,
-    /// which would only cut read concurrency.
+    /// Uses `BEGIN IMMEDIATE` to acquire a RESERVED lock immediately.
+    /// Under WAL mode, concurrent readers continue unblocked, while concurrent
+    /// write transactions queue cleanly on `busy_timeout` at the transaction start
+    /// instead of hitting unrecoverable `SQLITE_BUSY_SNAPSHOT` deadlocks during
+    /// deferred lock upgrades.
     pub fn transaction<R>(
-        &self,
+        &mut self,
         f: impl FnOnce(&Transaction<'_>) -> Result<R, SqliteError>,
     ) -> Result<R, SqliteError> {
-        self.inner.execute_batch("BEGIN")?;
+        self.inner.execute_batch("BEGIN IMMEDIATE")?;
         // ARM the rollback guard BEFORE running the closure: if `f` PANICS, the
         // explicit COMMIT/ROLLBACK below is bypassed and the guard's `Drop` is the
         // ONLY code that runs — it rolls the open `BEGIN` back. The Ok/Err paths
@@ -1925,6 +1950,22 @@ impl Transaction<'_> {
         F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
     {
         self.conn.query_each::<Q, F, E>(params, on_row)
+    }
+
+    /// Prepare a statement inside the transaction. The returned statement
+    /// borrows this transaction's connection and cannot outlive the transaction scope.
+    pub fn prepare_raw(&self, sql: &str) -> Result<SqliteStatement<'_>, SqliteError> {
+        self.conn.prepare_raw(sql)
+    }
+
+    /// Prepare a compile-checked `query!` carrier inside the transaction.
+    pub fn prepare<Q: SqliteTypedQuery>(
+        &self,
+    ) -> Result<SqliteTypedStatement<'_, Q>, SqliteError>
+    where
+        Q::Params<'static>: SqliteBindParams,
+    {
+        self.conn.prepare::<Q>()
     }
 }
 
@@ -2421,5 +2462,13 @@ mod arena_tests {
         assert!(rs.is_empty());
         assert_eq!(rs.len(), 0);
         assert!(rs.get(0).is_none());
+    }
+
+    #[test]
+    fn builder_overflow_flag_rejects_finish() {
+        let mut b = ArenaBuilder::new(1);
+        b.overflow = true;
+        let names: Arc<[String]> = Arc::from(vec!["x".to_string()]);
+        assert!(matches!(b.finish(names), Err(SqliteError::ResultTooLarge)));
     }
 }

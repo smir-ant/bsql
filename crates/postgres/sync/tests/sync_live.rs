@@ -2388,3 +2388,39 @@ fn prepared_statement_used_on_a_foreign_connection_is_rejected() {
     a.close().expect("close A");
     b.close().expect("close B");
 }
+
+/// WITNESS: a transaction that panics after its first verb is synchronously
+/// rolled back on drop during unwinding, leaving the connection in clean Idle state.
+#[test]
+#[ignore = "requires local PG"]
+fn transaction_panic_rolls_back_synchronously() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    c.execute_raw("CREATE TEMP TABLE t_tx_panic(id int PRIMARY KEY, v text)")
+        .expect("create table");
+
+    let prior_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        c.transaction(|tx| -> Result<(), bsql_postgres_sync::DriverError> {
+            tx.execute_raw("INSERT INTO t_tx_panic VALUES (1, 'panicked')")?;
+            panic!("boom inside transaction");
+        })
+    }));
+    std::panic::set_hook(prior_hook);
+    assert!(outcome.is_err(), "panic must propagate");
+
+    // Sync drop rolled back immediately:
+    assert!(!c.tx_needs_rollback());
+    assert_eq!(c.tx_status(), Some(bsql_postgres_sync::TxStatus::Idle));
+    assert!(c.is_healthy());
+
+    let rows = c
+        .query_raw("SELECT count(*) FROM t_tx_panic")
+        .expect("query after panic rollback must succeed");
+    assert_eq!(rows.get(0).expect("row").get_i64(0), Ok(Some(0)), "inserted row was rolled back");
+
+    c.close().expect("close");
+}
+

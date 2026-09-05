@@ -45,7 +45,6 @@
 use core::convert::Infallible;
 use core::future::{ready, Future};
 use core::ops::ControlFlow;
-use std::sync::Arc;
 
 use bsql_devgates::CountingAllocator;
 use bsql_postgres_core::{QueryResult, ResultCollector};
@@ -240,7 +239,11 @@ fn no_op_sink<'s>(
 /// `Vec<u32>` per `Deliver` for a value it never read — the last per-`Deliver`
 /// metadata allocation the hot dynamic SELECT path charged. The remaining
 /// per-call prebuffer cost a later slice (a pooled/reused collector) would trim.
-const EAGER_QUERY_ALLOC_PIN: usize = 18;
+/// **18 → 15** when single-pass schema parse (`parse_row_desc_and_names`) eliminated
+/// intermediate schema parsing allocations in dispatch.
+/// **15 → 14** when column names were stored as `Arc<[String]>` directly on `Deliver`,
+/// eliminating intermediate boxing and vec conversion.
+const EAGER_QUERY_ALLOC_PIN: usize = 14;
 
 /// PINNED baseline: allocations charged to the WHOLE warm `reset_session()`
 /// round-trip — a fresh `ResultCollector` over the LITERAL 7-statement idle
@@ -262,7 +265,9 @@ const EAGER_QUERY_ALLOC_PIN: usize = 18;
 /// single `pg_advisory_unlock_all` OID allocation this reset used to charge is
 /// gone. (The in-transaction `ROLLBACK`-prefixed variant is one statement longer
 /// — the idle path modelled here is the pooled steady state.)
-const RESET_ALLOC_PIN: usize = 14;
+/// **14 → 11** when single-pass schema parse (`parse_row_desc_and_names`) eliminated
+/// intermediate schema parsing allocations in dispatch.
+const RESET_ALLOC_PIN: usize = 11;
 
 #[test]
 fn eager_query_and_reset_prebuffer_allocs_are_pinned() {
@@ -334,8 +339,7 @@ fn run_query<'b>(
     // ── the literal body of Connection::build_query_result(collector, None) ──
     let (rows, command_tag, names) = collector.finish().expect("materialise owned rows");
     assert_eq!(rows.len(), QUERY_ROWS, "all rows sealed into the RowSet");
-    let column_names: Arc<[String]> = Arc::from(names.into_boxed_slice());
-    let result = QueryResult::new(rows, command_tag, column_names);
+    let result = QueryResult::new(rows, command_tag, names);
     // The result is lazy: no eager `Vec<Row>` was built, yet every row is still
     // reachable (and identical) through the on-demand accessors.
     assert_eq!(result.len(), QUERY_ROWS);

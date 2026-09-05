@@ -29,19 +29,19 @@ use crate::error::DriverError;
 const MAX_COMPONENT_LEN: usize = 63;
 
 /// Whether `s` is a single unquoted PG identifier: non-empty, ≤ 63 bytes, a
-/// leading ASCII letter or `_`, then ASCII letters / digits / `_` / `$`.
+/// leading letter or `_`, then letters / digits / `_` / `$`.
 fn is_unquoted_identifier(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let Some((&first, rest)) = bytes.split_first() else {
-        return false; // empty
+    if s.is_empty() || s.len() > MAX_COMPONENT_LEN {
+        return false;
+    }
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
     };
-    if bytes.len() > MAX_COMPONENT_LEN {
+    if !(first.is_alphabetic() || first == '_') {
         return false;
     }
-    if !(first.is_ascii_alphabetic() || first == b'_') {
-        return false;
-    }
-    rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
 /// A single SQL identifier PROVEN safe to splice verbatim into statement text.
@@ -82,6 +82,80 @@ impl<'a> SafeIdent<'a> {
     #[must_use]
     pub fn as_str(&self) -> &'a str {
         self.0
+    }
+}
+
+/// Const validator for unquoted ASCII identifiers.
+pub const fn is_unquoted_identifier_ascii_const(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() > MAX_COMPONENT_LEN {
+        return false;
+    }
+    let Some((&first, mut rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    while let Some((&b, next_rest)) = rest.split_first() {
+        if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'$') {
+            return false;
+        }
+        rest = next_rest;
+    }
+    true
+}
+
+/// Const validator for unquoted table identifiers (`table` or `schema.table`).
+pub const fn is_unquoted_table_ascii_const(bytes: &[u8]) -> bool {
+    const MAX_TABLE_LEN: usize = MAX_COMPONENT_LEN * 2 + 1;
+    if bytes.is_empty() || bytes.len() > MAX_TABLE_LEN {
+        return false;
+    }
+    let mut dot_idx = None;
+    let mut i: usize = 0;
+    let mut cur = bytes;
+    while let Some((&b, next)) = cur.split_first() {
+        if b == b'.' {
+            if dot_idx.is_some() {
+                return false;
+            }
+            dot_idx = Some(i);
+        }
+        let Some(next_i) = i.checked_add(1) else {
+            return false;
+        };
+        i = next_i;
+        cur = next;
+    }
+    match dot_idx {
+        None => is_unquoted_identifier_ascii_const(bytes),
+        Some(idx) => {
+            let Some((schema, rest)) = bytes.split_at_checked(idx) else {
+                return false;
+            };
+            let table = match rest.split_first() {
+                Some((_, t)) => t,
+                None => return false,
+            };
+            is_unquoted_identifier_ascii_const(schema) && is_unquoted_identifier_ascii_const(table)
+        }
+    }
+}
+
+impl SafeIdent<'static> {
+    /// Compile-time constructor for static unquoted ASCII identifiers.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time if `name` is empty, > 63 bytes, or contains
+    /// invalid/injection characters.
+    #[must_use]
+    pub const fn from_static(name: &'static str) -> Self {
+        assert!(
+            is_unquoted_identifier_ascii_const(name.as_bytes()),
+            "invalid SQL identifier: expected an unquoted name (letter or '_' followed by letters, digits, '_', '$', <= 63 bytes)"
+        );
+        Self(name)
     }
 }
 
@@ -129,6 +203,48 @@ impl<'a> SafeTable<'a> {
     pub fn as_str(&self) -> &'a str {
         self.0
     }
+}
+
+impl SafeTable<'static> {
+    /// Compile-time constructor for static unquoted table identifiers.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time if `table` is not a valid `table` or `schema.table`.
+    #[must_use]
+    pub const fn from_static(table: &'static str) -> Self {
+        assert!(
+            is_unquoted_table_ascii_const(table.as_bytes()),
+            "invalid SQL table identifier: expected unquoted 'table' or 'schema.table' (<= 63 bytes per component)"
+        );
+        Self(table)
+    }
+}
+
+/// Construct a compile-time validated [`SafeIdent`] with zero runtime overhead.
+#[macro_export]
+macro_rules! safe_ident {
+    ($name:literal) => {{
+        const __BSQL_SAFE_IDENT: $crate::SafeIdent<'static> = $crate::SafeIdent::from_static($name);
+        __BSQL_SAFE_IDENT
+    }};
+    ($name:ident) => {{
+        const __BSQL_SAFE_IDENT: $crate::SafeIdent<'static> = $crate::SafeIdent::from_static(stringify!($name));
+        __BSQL_SAFE_IDENT
+    }};
+}
+
+/// Construct a compile-time validated [`SafeTable`] with zero runtime overhead.
+#[macro_export]
+macro_rules! safe_table {
+    ($name:literal) => {{
+        const __BSQL_SAFE_TABLE: $crate::SafeTable<'static> = $crate::SafeTable::from_static($name);
+        __BSQL_SAFE_TABLE
+    }};
+    ($name:ident) => {{
+        const __BSQL_SAFE_TABLE: $crate::SafeTable<'static> = $crate::SafeTable::from_static(stringify!($name));
+        __BSQL_SAFE_TABLE
+    }};
 }
 
 // ── Splice seam ──────────────────────────────────────────────────────────────
@@ -240,5 +356,26 @@ mod tests {
         assert_eq!(unlisten_sql(chan), "UNLISTEN events");
         assert_eq!(copy_out_sql(one), "COPY my_table TO STDOUT");
         assert_eq!(copy_in_sql(two), "COPY public.my_table FROM STDIN");
+    }
+
+    #[test]
+    fn const_ident_and_table_macros_evaluate_compile_time() {
+        let id1 = SafeIdent::from_static("events");
+        assert_eq!(id1.as_str(), "events");
+
+        let id2 = safe_ident!("orders");
+        assert_eq!(id2.as_str(), "orders");
+
+        let id3 = safe_ident!(users);
+        assert_eq!(id3.as_str(), "users");
+
+        let t1 = SafeTable::from_static("users");
+        assert_eq!(t1.as_str(), "users");
+
+        let t2 = safe_table!("public.orders");
+        assert_eq!(t2.as_str(), "public.orders");
+
+        let t3 = safe_table!(accounts);
+        assert_eq!(t3.as_str(), "accounts");
     }
 }

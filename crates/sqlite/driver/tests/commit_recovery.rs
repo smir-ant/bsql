@@ -23,7 +23,7 @@ use bsql_sqlite::{Connection, SqliteError};
 
 #[test]
 fn a_commit_failure_rolls_back_and_preserves_the_classified_error() {
-    let conn = Connection::open_in_memory().expect("open in-memory");
+    let mut conn = Connection::open_in_memory().expect("open in-memory");
     conn.execute_raw("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
         .expect("create parent");
     conn.execute_raw(

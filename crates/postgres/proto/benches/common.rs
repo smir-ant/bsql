@@ -137,14 +137,40 @@ fn command_tail(rows: usize) -> Vec<u8> {
     out
 }
 
+/// RowDescription for the demo query: `id` int4 (oid 23) and `name` text (oid 25).
+#[must_use]
+pub fn demo_row_description() -> Vec<u8> {
+    let mut body = 2_i16.to_be_bytes().to_vec();
+    // col 1: "id", int4 (oid 23)
+    body.extend_from_slice(b"id\0");
+    body.extend_from_slice(&0_i32.to_be_bytes()); // table OID
+    body.extend_from_slice(&1_i16.to_be_bytes()); // column attribute number
+    body.extend_from_slice(&23_u32.to_be_bytes()); // data type OID (int4)
+    body.extend_from_slice(&4_i16.to_be_bytes()); // data type size
+    body.extend_from_slice(&(-1_i32).to_be_bytes()); // type modifier
+    body.extend_from_slice(&0_i16.to_be_bytes()); // format code (text)
+
+    // col 2: "name", text (oid 25)
+    body.extend_from_slice(b"name\0");
+    body.extend_from_slice(&0_i32.to_be_bytes()); // table OID
+    body.extend_from_slice(&2_i16.to_be_bytes()); // column attribute number
+    body.extend_from_slice(&25_u32.to_be_bytes()); // data type OID (text)
+    body.extend_from_slice(&(-1_i16).to_be_bytes()); // data type size (-1 varlena)
+    body.extend_from_slice(&(-1_i32).to_be_bytes()); // type modifier
+    body.extend_from_slice(&0_i16.to_be_bytes()); // format code (text)
+
+    frame(b'T', &body)
+}
+
 /// The cache-MISS reply for `query_params`: the statement is not yet parsed, so
 /// the verb sends Close+Parse+Bind+Execute+Sync and the server answers
-/// CloseComplete, ParseComplete, BindComplete, `rows` DataRows, then the tail.
+/// CloseComplete, ParseComplete, BindComplete, RowDescription, `rows` DataRows, then the tail.
 #[must_use]
 pub fn miss_reply(rows: usize) -> Vec<u8> {
     let mut out = frame(b'3', &[]); // CloseComplete
     out.extend_from_slice(&frame(b'1', &[])); // ParseComplete
     out.extend_from_slice(&frame(b'2', &[])); // BindComplete
+    out.extend_from_slice(&demo_row_description()); // RowDescription
     for i in 0..rows {
         let id = i32::try_from(i).expect("row index fits i32");
         out.extend_from_slice(&demo_row(id, "bench"));

@@ -106,7 +106,7 @@ use super::{Event, IngestBuf, IngestCommitOverflow, IngestFull};
 use crate::action::TxStatus;
 use crate::command_tag::{parse_command_tag_bytes, CommandTag};
 use crate::decode::{
-    parse_column_names, parse_copy_response_header, parse_param_description, parse_row_description,
+    parse_copy_response_header, parse_param_description, parse_row_desc_and_names,
 };
 use crate::frame::{HeaderParse, HEADER_LEN};
 use crate::narrow::usize_from_u32;
@@ -513,6 +513,12 @@ pub struct ActiveEngine {
     /// `#[cold]` helper — so `next_event`'s hot frame is unperturbed. `false` in
     /// steady state.
     pipelining: bool,
+    /// Whether a trailing `Sync` has already been staged onto the send buffer for
+    /// the currently in-flight pipeline batch. When `pipelining` is true but this
+    /// flag is false, the connection was dropped mid-intermediate-window without
+    /// an owed `Sync`; recovery must stage a trailing `Sync` before draining to
+    /// prevent hanging forever on a missing RFQ.
+    pipeline_sync_staged: bool,
     /// TYPED-result-schema guard arm. Set by a compile-checked cache-MISS whose
     /// staging appends a `Describe(portal)` so the server returns a `RowDescription`:
     /// the single-query path (`stage_compiled_query`) and the heterogeneous
@@ -680,6 +686,7 @@ impl ActiveEngine {
             pending_prelude: None,
             prelude_active: false,
             pipelining: false,
+            pipeline_sync_staged: false,
             result_guard_armed: false,
             result_mismatch: None,
             pipeline_guard_oids: Vec::new(),
@@ -1126,6 +1133,7 @@ impl ActiveEngine {
     #[inline]
     pub fn begin_pipeline(&mut self) {
         self.pipelining = true;
+        self.pipeline_sync_staged = false;
         // Start each batch with an EMPTY per-command guard FIFO. A completed batch
         // drains it empty; a mismatch/error-drained batch leaves an un-popped tail
         // (harmless `'static` pointers, no owned data), so clearing HERE — at the
@@ -1169,6 +1177,7 @@ impl ActiveEngine {
     #[inline]
     pub fn abort_pipeline_staging(&mut self) {
         self.pipelining = false;
+        self.pipeline_sync_staged = false;
         // Discard any per-command guard OIDs pushed for the commands staged before
         // the overflow: nothing was flushed, so no reply will pop them, and the next
         // batch's `begin_pipeline` would clear them anyway — clearing HERE keeps the
@@ -1177,6 +1186,28 @@ impl ActiveEngine {
         self.reset_columns();
         self.prelude_active = false;
         self.state = ActiveState::Idle;
+    }
+
+    /// Whether a pipeline batch is currently in flight.
+    #[inline]
+    #[must_use]
+    pub fn is_pipelining(&self) -> bool {
+        self.pipelining
+    }
+
+    /// Whether a pipeline batch is in flight and has NOT yet had its trailing Sync
+    /// staged. If dropped in this state, recovery must stage a trailing Sync to
+    /// prevent hanging on a server that is waiting for the client.
+    #[inline]
+    #[must_use]
+    pub fn is_pipelining_without_sync(&self) -> bool {
+        self.pipelining && !self.pipeline_sync_staged
+    }
+
+    /// Mark that the batch's trailing `Sync` has been staged onto the send buffer.
+    #[inline]
+    pub fn mark_pipeline_sync_staged(&mut self) {
+        self.pipeline_sync_staged = true;
     }
 
     /// Seat the engine to await the fused one-round-trip runtime-param batch's
@@ -1301,42 +1332,41 @@ impl ActiveEngine {
                 return outcome;
             }
 
-            match self.ingest.peek_header() {
-                HeaderParse::Empty | HeaderParse::Incomplete => return ActiveOutcome::NeedMore,
-                HeaderParse::MalformedLength { .. } => {
+            match self.ingest.take_frame_fast() {
+                Err(HeaderParse::Empty | HeaderParse::Incomplete) | Ok(None) => {
+                    return ActiveOutcome::NeedMore
+                }
+                Err(HeaderParse::MalformedLength { .. }) => {
                     self.state = ActiveState::Failed;
                     return ActiveOutcome::Close;
                 }
-                HeaderParse::FrameTooLarge { declared } => {
+                Err(HeaderParse::FrameTooLarge { declared }) => {
                     let outcome = self.begin_oversize(declared);
                     if matches!(outcome, ActiveOutcome::Silent) {
                         continue;
                     }
                     return outcome;
                 }
-                HeaderParse::Ok { .. } => match self.ingest.take_frame() {
-                    // Header parsed but the whole body is not yet buffered.
-                    None => return ActiveOutcome::NeedMore,
-                    Some((tag, start, end)) => {
-                        // Asynchronous frames are surfaced regardless of command
-                        // phase (active-phase steady state), and never advance
-                        // the command state machine.
-                        match tag {
-                            T_NOTICE => return ActiveOutcome::Notice(Lend::Ingest, start, end),
-                            T_NOTIFY => return ActiveOutcome::Notify(Lend::Ingest, start, end),
-                            T_PARAM_STATUS => {
-                                return ActiveOutcome::ParamStatus(Lend::Ingest, start, end)
+                Ok(Some((tag, start, end))) => {
+                    // Asynchronous frames are surfaced regardless of command
+                    // phase (active-phase steady state), and never advance
+                    // the command state machine.
+                    match tag {
+                        T_NOTICE => return ActiveOutcome::Notice(Lend::Ingest, start, end),
+                        T_NOTIFY => return ActiveOutcome::Notify(Lend::Ingest, start, end),
+                        T_PARAM_STATUS => {
+                            return ActiveOutcome::ParamStatus(Lend::Ingest, start, end)
+                        }
+                        _ => {
+                            let outcome = self.step_frame(tag, start, end);
+                            if matches!(outcome, ActiveOutcome::Silent) {
+                                continue;
                             }
-                            _ => {
-                                let outcome = self.step_frame(tag, start, end);
-                                if matches!(outcome, ActiveOutcome::Silent) {
-                                    continue;
-                                }
-                                return outcome;
-                            }
+                            return outcome;
                         }
                     }
-                },
+                }
+                Err(HeaderParse::Ok { .. }) => return ActiveOutcome::NeedMore,
             }
         }
     }
@@ -2223,6 +2253,7 @@ impl ActiveEngine {
                     // failure) can never leak `pipelining` into the next command. A
                     // no-op single store in steady state (the flag is already false).
                     self.pipelining = false;
+                    self.pipeline_sync_staged = false;
                     self.state = ActiveState::Idle;
                     ActiveOutcome::Idle
                 }
@@ -2315,28 +2346,28 @@ impl ActiveEngine {
     #[inline(never)]
     fn drive_prelude(&mut self) -> ActiveOutcome {
         loop {
-            match self.ingest.peek_header() {
-                HeaderParse::Empty | HeaderParse::Incomplete => return ActiveOutcome::NeedMore,
-                HeaderParse::MalformedLength { .. } | HeaderParse::FrameTooLarge { .. } => {
+            match self.ingest.take_frame_fast() {
+                Err(HeaderParse::Empty | HeaderParse::Incomplete) | Ok(None) => {
+                    return ActiveOutcome::NeedMore
+                }
+                Err(HeaderParse::MalformedLength { .. } | HeaderParse::FrameTooLarge { .. }) => {
                     return self.prelude_teardown();
                 }
-                HeaderParse::Ok { .. } => match self.ingest.take_frame() {
-                    None => return ActiveOutcome::NeedMore,
-                    Some((tag, start, end)) => match tag {
-                        T_NOTICE => return ActiveOutcome::Notice(Lend::Ingest, start, end),
-                        T_NOTIFY => return ActiveOutcome::Notify(Lend::Ingest, start, end),
-                        T_PARAM_STATUS => {
-                            return ActiveOutcome::ParamStatus(Lend::Ingest, start, end)
+                Ok(Some((tag, start, end))) => match tag {
+                    T_NOTICE => return ActiveOutcome::Notice(Lend::Ingest, start, end),
+                    T_NOTIFY => return ActiveOutcome::Notify(Lend::Ingest, start, end),
+                    T_PARAM_STATUS => {
+                        return ActiveOutcome::ParamStatus(Lend::Ingest, start, end)
+                    }
+                    _ => {
+                        let outcome = self.step_prelude(tag, start, end);
+                        if matches!(outcome, ActiveOutcome::Silent) {
+                            continue;
                         }
-                        _ => {
-                            let outcome = self.step_prelude(tag, start, end);
-                            if matches!(outcome, ActiveOutcome::Silent) {
-                                continue;
-                            }
-                            return outcome;
-                        }
-                    },
+                        return outcome;
+                    }
                 },
+                Err(HeaderParse::Ok { .. }) => return ActiveOutcome::NeedMore,
             }
         }
     }
@@ -2774,10 +2805,7 @@ impl ActiveEngine {
 fn parse_row_desc_owned(
     body: &[u8],
 ) -> Result<(Vec<u32>, Vec<String>), crate::error::ProtocolError> {
-    let rd = parse_row_description(body)?;
-    let oids = rd.columns_iter().map(|c| c.type_oid).collect::<Vec<u32>>();
-    let names = parse_column_names(body)?;
-    Ok((oids, names))
+    parse_row_desc_and_names(body)
 }
 
 /// Is `tag` a payload-bearing control/async frame whose oversize is absorbed

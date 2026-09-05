@@ -17,8 +17,7 @@ note: inside `bsql_postgres_proto::prepared::run::<Hostile>`
 note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
   --> $RUST/core/src/panic.rs
    |
-   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
-   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   = note: the failure occurred here
    |
   ::: $WORKSPACE/crates/postgres/proto/src/prepared.rs
    |

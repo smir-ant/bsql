@@ -54,7 +54,7 @@ use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, Diagnostics, DriverError,
     Endpoint, MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification,
-    window_after_statement, Pipeline, QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
+    window_after_statement, Pipeline, QueryResult, Redial, Row, Rows, SslMode, TxStatus, TypedNotification,
     WindowAction,
 };
 // Referenced only by the non-unix `Endpoint::Unix` reject arm in `dial_socket`.
@@ -466,7 +466,7 @@ impl Connection {
 
         let mut this = Self {
             core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
-            redial: Redial::from_config(config),
+            redial: Redial::from_config(config, encrypted),
             socket_ctl: Some(socket_ctl),
             steady_read_timeout,
             connect_read_timeout: steady_read_timeout,
@@ -521,7 +521,7 @@ impl Connection {
             core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
             // The in-memory fake has no network endpoint; a nominal loopback
             // redial satisfies the field (a testkit connection is never canceled).
-            redial: Redial::from_config(&ConnectConfig::new("localhost", "")),
+            redial: Redial::from_config(&ConnectConfig::new("localhost", ""), false),
             socket_ctl: None,
             // No socket to bound and the fake never blocks — the steady read
             // timeout is a no-op here.
@@ -1275,7 +1275,9 @@ impl Connection {
                 begin_armed: false,
             };
             let outcome = f(&mut tx);
-            (outcome, tx.begin_armed)
+            let opened = tx.begin_armed;
+            tx.disarm();
+            (outcome, opened)
         };
         // Terminate ONLY if a verb actually opened the transaction. An empty body
         // armed no BEGIN, so there is nothing to commit or roll back — and the
@@ -1668,6 +1670,20 @@ impl Connection {
         self.core.is_healthy()
     }
 
+    /// Return the current transaction status observed from the server (`Idle`, `InTransaction`, `Failed`).
+    #[must_use]
+    #[inline]
+    pub fn tx_status(&self) -> Option<TxStatus> {
+        self.core.tx_status()
+    }
+
+    /// Whether an interrupted or cancelled transaction is pending rollback before issuing new commands.
+    #[must_use]
+    #[inline]
+    pub fn tx_needs_rollback(&self) -> bool {
+        self.core.tx_needs_rollback()
+    }
+
     /// The server version reported at connect, if recovered.
     #[must_use]
     pub fn server_version(&self) -> Option<&str> {
@@ -1825,7 +1841,25 @@ impl TxWindow<'_> {
     }
 }
 
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        if self.begin_armed {
+            self.core.mark_tx_needs_rollback();
+            // Best-effort synchronous rollback on panic:
+            let _ = drive_sync(engine::poll_once(self.core.simple_query("ROLLBACK")));
+            self.core.clear_tx_needs_rollback();
+            self.core.n1_reset();
+        }
+    }
+}
+
 impl Transaction<'_> {
+    /// Disarm the drop guard on normal transaction completion.
+    #[inline]
+    fn disarm(&mut self) {
+        self.begin_armed = false;
+    }
+
     /// Arm the deferred `BEGIN` once, immediately BEFORE the first verb runs.
     ///
     /// The first verb the body issues opens the transaction — its flush fuses the

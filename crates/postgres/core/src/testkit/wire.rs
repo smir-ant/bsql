@@ -159,8 +159,12 @@ pub const fn array_type_name(element_oid: i32) -> &'static str {
 }
 
 /// Transaction-status byte for `ReadyForQuery`: `I` = idle (not in a
-/// transaction block) — the only status the MVP fake reports.
+/// transaction block).
 pub const TX_IDLE: u8 = b'I';
+/// Transaction-status byte for `ReadyForQuery`: `T` = inside a transaction block.
+pub const TX_IN_TRANSACTION: u8 = b'T';
+/// Transaction-status byte for `ReadyForQuery`: `E` = transaction failed.
+pub const TX_FAILED: u8 = b'E';
 
 /// Why a fake server reply could not be encoded.
 ///

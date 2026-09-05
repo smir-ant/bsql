@@ -62,15 +62,14 @@ use bsql_postgres_proto::engine::{
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    DecodeError, Sensitive, StmtName, TxStatus, TypedCopyIn, TypedQuery, PGCOPY_BINARY_HEADER,
-    PGCOPY_BINARY_TRAILER,
+    DecodeError, Sensitive, StmtName, TxStatus, TypedCopyIn, TypedQuery,
 };
 
 use crate::cancel::CancelKey;
 use crate::materialize::{self, ResultCollector};
 use crate::pipeline::{Bound, Pipeline};
 use crate::sql_ident::{self, SafeIdent, SafeTable};
-use crate::types::ColSlot;
+use crate::types::SlotsScratch;
 use crate::BorrowedRow;
 use crate::tls::{TlsError, Wire};
 // `CaRootsError` names a rustls parse failure, so it exists only under `tls`.
@@ -115,7 +114,7 @@ enum Stop<E> {
 fn decode_and_hand<F, E>(
     body: &[u8],
     on_row: &mut F,
-    slots: &mut Vec<ColSlot>,
+    slots: &mut SlotsScratch,
 ) -> ControlFlow<Stop<E>>
 where
     F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
@@ -141,7 +140,7 @@ where
 fn stream_dynamic_row<F, E>(
     surface: Surface<'_>,
     on_row: &mut F,
-    slots: &mut Vec<ColSlot>,
+    slots: &mut SlotsScratch,
     oversize: &mut Vec<u8>,
     db_error: &mut Option<DbError>,
 ) -> ControlFlow<Stop<E>>
@@ -900,6 +899,9 @@ pub struct Core<S: Transport<Error = io::Error>> {
     /// or `None` (the blocking driver + testkit, which never reach `DIRTY_DRAIN`).
     /// Set once after construction by the async driver's `connect_with`.
     recovery_cancel: Option<Arc<dyn RecoveryCancel>>,
+    /// Whether an abandoned or cancelled transaction was left uncommitted and
+    /// must be rolled back before the next command.
+    tx_needs_rollback: bool,
     /// The diagnostics-only N+1 query detector. Present ONLY under the
     /// `n1-detect` feature — a default build has no such field, so the flagship
     /// typed verbs stay byte-identical and the footprint is unchanged.
@@ -944,9 +946,30 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             diag: crate::diag::Diagnostics::default(),
             dirty: Arc::new(AtomicU8::new(DIRTY_CLEAN)),
             recovery_cancel: None,
+            tx_needs_rollback: false,
             #[cfg(feature = "n1-detect")]
             n1_tracker: crate::N1Tracker::new(),
         }
+    }
+
+    /// Mark that an uncommitted transaction was abandoned (e.g. future dropped or
+    /// closure panicked mid-transaction) and must be rolled back before the next command.
+    #[inline]
+    pub fn mark_tx_needs_rollback(&mut self) {
+        self.tx_needs_rollback = true;
+    }
+
+    /// Clear the transaction rollback requirement after a successful rollback.
+    #[inline]
+    pub fn clear_tx_needs_rollback(&mut self) {
+        self.tx_needs_rollback = false;
+    }
+
+    /// Whether an abandoned transaction is pending rollback.
+    #[inline]
+    #[must_use]
+    pub fn tx_needs_rollback(&self) -> bool {
+        self.tx_needs_rollback
     }
 
     /// Install the driver-provided out-of-band cancel dial used by dropped-future
@@ -1060,6 +1083,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// classified transport error, `is_disconnect()`), never a torn "recovered"
     /// connection handed to a pool.
     async fn begin_command(&mut self) -> Result<Live<'static>, DriverError> {
+        if self.tx_needs_rollback {
+            core::hint::cold_path();
+            if self.dirty.load(Ordering::Acquire) == DIRTY_DRAIN {
+                self.recover_drain().await?;
+            } else {
+                self.rollback_leftover_transaction().await?;
+            }
+            self.tx_needs_rollback = false;
+        }
+
         // Fast path: a live token is present. No `.await` here, so a drop cannot
         // strand a half-taken state before the caller arms its scope.
         if let Some(live) = self.live.take() {
@@ -1128,6 +1161,13 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // 2. Re-mint (sound: `self.live` is provably `None` and `dirty` was
         //    DIRTY_DRAIN, so the prior token was dropped — no other token exists)
         //    and drain to an RFQ. `drain_to_idle` restores `self.live` on success.
+        // If a pipeline was dropped mid-intermediate window before the trailing Sync
+        // was staged, the server has paused waiting for the client and will NEVER send
+        // an RFQ without a Sync. Stage the trailing Sync now so PostgreSQL emits
+        // ReadyForQuery deterministically, eliminating deadlocks.
+        if self.engine.is_pipelining_without_sync() {
+            self.engine.stage_pipeline_seal();
+        }
         let live = self.engine.reclaim_live_after_drop();
         if let Err(e) = self.drain_to_idle(live).await {
             core::hint::cold_path();
@@ -1162,10 +1202,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // The last RFQ's tx-status byte. `Idle` → nothing to roll back. A
         // `WrongPhase` (unreachable after a clean drain) is conservatively treated
         // as "nothing to roll back" — the drain proved the connection idle.
-        if !matches!(
-            self.engine.tx_status(),
-            Ok(TxStatus::InTransaction | TxStatus::Failed)
-        ) {
+        if !self.tx_needs_rollback
+            && !matches!(
+                self.engine.tx_status(),
+                Ok(TxStatus::InTransaction | TxStatus::Failed)
+            )
+        {
             return Ok(());
         }
         core::hint::cold_path();
@@ -1190,7 +1232,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 }),
             )
             .await;
-        self.settle(outcome, &mut collector)
+        let res = self.settle(outcome, &mut collector);
+        self.tx_needs_rollback = false;
+        self.n1_reset();
+        res
     }
 
     /// Arm a [`CancelScope`] over a CLONE of this connection's `dirty` handle,
@@ -1316,8 +1361,8 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ) -> Result<QueryResult, DriverError> {
         let (rows, command_tag, names) = collector.finish()?;
         let column_names = match names_override {
-            Some(names) => names,
-            None => Arc::from(names.into_boxed_slice()),
+            Some(override_names) => override_names,
+            None => names,
         };
         Ok(QueryResult::new(rows, command_tag, column_names))
     }
@@ -2675,8 +2720,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 }
             }
             Boundary::Stopped(Stop::User(e)) => {
-                // Caller broke early: drain to reclaim, then report the stop value.
-                self.drain_to_idle(live).await?;
+                // Caller broke early: attempt a bounded drain. If the remainder is
+                // small (within budget), drain to idle so the connection is reclaimed.
+                // If it's a massive result set, abort by closing the connection so the
+                // server terminates execution immediately rather than downloading gigabytes.
+                self.drain_early_break(live).await?;
                 Ok(Some(e))
             }
             Boundary::Stopped(Stop::Decode(de)) => {
@@ -2721,7 +2769,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             // the oversize-row reassembly buffer. Both retain their capacity across
             // rows (cleared, never reallocated), so streaming a colossal result
             // allocates NOTHING per row — the constant-memory invariant.
-            let mut slots: Vec<ColSlot> = Vec::new();
+            let mut slots = SlotsScratch::new();
             let mut oversize: Vec<u8> = Vec::new();
             let outcome = this
                 .engine
@@ -2764,7 +2812,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let out = async move {
             let this = self;
             let mut db_error: Option<DbError> = None;
-            let mut slots: Vec<ColSlot> = Vec::new();
+            let mut slots = SlotsScratch::new();
             let mut oversize: Vec<u8> = Vec::new();
             let outcome = this
                 .engine
@@ -2809,6 +2857,56 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 Ok(())
             }
             Err(other) => Err(lift_engine_error(other)),
+        }
+    }
+
+    /// Maximum frames we are willing to drain from an early-stopped streaming
+    /// query before deciding the remainder is too large and closing the socket.
+    const MAX_EARLY_BREAK_DRAIN_FRAMES: usize = 128;
+
+    /// Drain an early-stopped streaming query with a bounded frame limit.
+    ///
+    /// When a consumer stops a stream with `ControlFlow::Break`, draining a
+    /// handful of remaining rows is cheaper than tearing down and reconnecting a
+    /// pooled connection. However, if the query returns millions of rows, draining
+    /// to idle would freeze the task and pull gigabytes of garbage over TCP.
+    /// This method drains up to [`MAX_EARLY_BREAK_DRAIN_FRAMES`]: if the command
+    /// reaches `Boundary::Idle` within budget, the connection is restored to `self.live`.
+    /// If the budget is exhausted, `live` is consumed and dropped, which drops the
+    /// socket. The kernel sends a TCP RST/FIN to PostgreSQL, terminating the server
+    /// query immediately.
+    async fn drain_early_break(&mut self, live: Live<'static>) -> Result<(), DriverError> {
+        let mut frames_left = Self::MAX_EARLY_BREAK_DRAIN_FRAMES;
+        let outcome = self
+            .engine
+            .run_pipeline_break(
+                live,
+                capture_notify(&mut self.notifications, self.diag.sink(), |_s: Surface<'_>| {
+                    if frames_left == 0 {
+                        ControlFlow::Break(())
+                    } else {
+                        frames_left = frames_left.saturating_sub(1);
+                        ControlFlow::Continue(())
+                    }
+                }),
+            )
+            .await;
+
+        match outcome {
+            Ok(Outcome { live, status }) => match status {
+                Boundary::Idle => {
+                    self.live = Some(live);
+                    Ok(())
+                }
+                _ => {
+                    self.live = None;
+                    Ok(())
+                }
+            },
+            Err(_) => {
+                self.live = None;
+                Ok(())
+            }
         }
     }
 
@@ -4116,9 +4214,8 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///
     /// `#[doc(hidden)]`: an internal seam for the migration runner, not consumer
     /// surface.
-    #[doc(hidden)]
     #[inline]
-    pub(crate) fn tx_status(&self) -> Option<TxStatus> {
+    pub fn tx_status(&self) -> Option<TxStatus> {
         self.engine.tx_status().ok()
     }
 
@@ -4238,12 +4335,13 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // its call), so it is armed and consumed within one verb's flush and can
         // never persist to a pool checkout. A cancelled or panicked transaction that
         // ran no verb armed nothing, so there is no prelude to discard.
-        let sql = if matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
+        let sql = if !self.tx_needs_rollback && matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
             RESET
         } else {
             RESET_WITH_ROLLBACK
         };
         self.simple_query(sql).await?;
+        self.tx_needs_rollback = false;
         // DROP BOTH prepared-statement caches — the ONE RULE: a statement cache lives
         // within a single connection LEASE, never across a pool checkout. Neither the
         // DYNAMIC (runtime-SQL) cache nor the TYPED (compile-checked `query!`) cache
@@ -4515,9 +4613,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///
     /// The whole orchestration lives ONCE here in the transport-generic
     /// [`Core`](Self): issue the catalog-baked `Q::SQL` COPY command, stream the
-    /// PGCOPY binary [header](PGCOPY_BINARY_HEADER), then each `rows` item as one
+    /// PGCOPY binary [header](bsql_postgres_proto::PGCOPY_BINARY_HEADER), then each `rows` item as one
     /// typed binary row (through the SAME [`ParamsWriter`] encoders the `query!`
-    /// param path uses), then the [trailer](PGCOPY_BINARY_TRAILER), then
+    /// param path uses), then the [trailer](bsql_postgres_proto::PGCOPY_BINARY_TRAILER), then
     /// `CopyDone`. Both drivers forward here (async `.await`, sync single-poll),
     /// so their typed-COPY behaviour is a COMPILER guarantee, not hand-maintained
     /// twins. The rows are NOT pre-collected — a megarow load streams in bounded
@@ -4559,19 +4657,18 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// Stream the PGCOPY binary body — header, then each typed row, then trailer
     /// — for [`copy_in_typed`](Self::copy_in_typed). Factored out so the token is
     /// held by the caller across the whole stream and handed to the terminal
-    /// `copy_in_finish` / `copy_in_abort` step. Each piece rides its own batched
-    /// `CopyData`; frame boundaries are irrelevant to the PGCOPY stream.
+    /// `copy_in_finish` / `copy_in_abort` step. Batches rows into aggregated 64 KiB
+    /// `CopyData` frames, reducing frame header overhead and length backpatches by
+    /// orders of magnitude.
     async fn copy_in_typed_stream<'q, Q, I>(&mut self, rows: I) -> Result<(), DriverError>
     where
         Q: TypedCopyIn,
         I: IntoIterator<Item = Q::Row<'q>>,
     {
-        self.copy_in_write(&PGCOPY_BINARY_HEADER).await?;
-        for row in rows {
-            self.copy_in_write_binary_row(&row).await?;
-        }
-        self.copy_in_write(&PGCOPY_BINARY_TRAILER).await?;
-        Ok(())
+        self.engine
+            .copy_in_stream_typed_binary(rows)
+            .await
+            .map_err(lift_engine_error)
     }
 
     // ── Notification seam (the per-driver `recv_notification` orchestrates) ──

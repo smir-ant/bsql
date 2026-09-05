@@ -1,10 +1,11 @@
-# Publish-only release automation — NOT test CI.
+# Publish-only release automation.
 #
-# bsql runs its test/lint/gate wall LOCALLY via `cargo` + the `bsql-devgates`
-# crate (see CLAUDE.md "Build & test" / "Verification"); there is deliberately no
-# CI that builds or tests on push. This workflow does ONE thing: publish every
-# shippable crate to crates.io in dependency (topological) order — on a published
-# GitHub Release, or on manual dispatch (to resume a rate-limited run).
+# Testing lives in the sibling `test.yml` workflow (offline gates on every push
+# plus a live PostgreSQL 15-18 matrix) and in the LOCAL `cargo` + `bsql-devgates`
+# wall, which stays primary — see CLAUDE.md "Build & test". This workflow does
+# ONE thing: publish every shippable crate to crates.io in dependency
+# (topological) order — on a published GitHub Release, or on manual dispatch (to
+# resume a rate-limited run).
 #
 # Requires the repository secret CRATES_IO_TOKEN (a crates.io API token scoped to
 # publish-new + publish-update). It is idempotent AND rate-limit-aware:

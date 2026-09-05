@@ -25,6 +25,8 @@
 use bsql_postgres_proto::command_tag::CommandTag;
 use bsql_postgres_proto::engine::Surface;
 
+use std::sync::Arc;
+
 use crate::error::{DbError, DriverError};
 use crate::types::{ArenaBuilder, Notification, RowSet};
 
@@ -87,7 +89,7 @@ pub struct ResultCollector {
     /// costs no tag allocation; the affected-row count is a typed projection of
     /// it ([`affected`](Self::affected)), so no separate `affected` field.
     command_tag: CommandTag,
-    column_names: Vec<String>,
+    column_names: Arc<[String]>,
     db_error: Option<DbError>,
     decode_error: Option<DriverError>,
     /// The `(count, max)` of a too-wide `RowDescription` parked from a
@@ -112,9 +114,21 @@ impl ResultCollector {
     /// an inline one.
     pub fn feed(&mut self, surface: Surface<'_>) {
         match surface {
-            Surface::Row(body) => self.push_row_body(body),
-            Surface::RowChunk(bytes) => self.chunk.extend_from_slice(bytes),
+            Surface::Row(body) => {
+                if !self.builder.as_ref().is_some_and(ArenaBuilder::is_overflow) {
+                    self.push_row_body(body);
+                }
+            }
+            Surface::RowChunk(bytes) => {
+                if !self.builder.as_ref().is_some_and(ArenaBuilder::is_overflow) {
+                    self.chunk.extend_from_slice(bytes);
+                }
+            }
             Surface::RowChunkEnd => {
+                if self.builder.as_ref().is_some_and(ArenaBuilder::is_overflow) {
+                    self.chunk.clear();
+                    return;
+                }
                 // Detach the reassembled body to parse it (`push_row_body` needs
                 // `&mut self`, so it cannot also borrow `self.chunk`), then RETAIN
                 // the buffer's capacity for the next oversize row rather than
@@ -137,21 +151,10 @@ impl ResultCollector {
                     // `Describe` completion): the empty tag, no row count.
                     None => CommandTag::EMPTY,
                 };
-                // The delivered `oids` slice is DELIBERATELY dropped here: the
-                // result-column type OIDs are read at EXACTLY ONE site — the cold
-                // `prepare_with_oids`, which captures them into its own owned Vec
-                // in its pump closure. Every dynamic ROW-RETURNING verb
-                // (`query_raw` / `query_params` / `simple_query`) fed this
-                // collector but never reads its OIDs, so storing them charged
-                // that hot path one heap `Vec<u32>` per `Deliver` for a value
-                // nobody read. Not capturing them here is that allocation gone.
-                //
-                // `column_names` stays `= to_vec()`: it flows into
-                // `build_query_result`'s `Arc::from(_.into_boxed_slice())` on the
-                // HOT `query_raw` path, and `into_boxed_slice()` is free only when
-                // cap == len — which `to_vec` guarantees but an `extend`'s
-                // amortized growth (cap 4 for 2 names) does not.
-                self.column_names = names.to_vec();
+                // Store the column names directly as `Arc<[String]>` only when non-empty.
+                if !names.is_empty() {
+                    self.column_names = Arc::from(names);
+                }
             }
             Surface::Fail(body) => self.db_error = Some(parse_error_response(body)),
             // A too-wide result classified as recoverable `TooManyColumns`: park
@@ -209,7 +212,7 @@ impl ResultCollector {
     /// [`DriverError::MixedResultWidth`] if a multi-statement batch delivered
     /// rows of differing column counts (which the single arena's fixed stride
     /// cannot represent without mis-addressing cells).
-    pub fn finish(self) -> Result<(RowSet, CommandTag, Vec<String>), DriverError> {
+    pub fn finish(self) -> Result<(RowSet, CommandTag, Arc<[String]>), DriverError> {
         if let Some(e) = self.decode_error {
             return Err(e);
         }
@@ -227,6 +230,9 @@ impl ResultCollector {
     /// column count / length other than the `-1` NULL sentinel, parks a decode
     /// error rather than mis-addressing cells.
     fn push_row_body(&mut self, body: &[u8]) {
+        if self.builder.as_ref().is_some_and(ArenaBuilder::is_overflow) {
+            return;
+        }
         let mut cursor = 0usize;
         let n_cols = match read_be_i16(body, &mut cursor) {
             Some(n) if n >= 0 => n,

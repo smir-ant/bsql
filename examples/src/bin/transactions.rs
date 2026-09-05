@@ -31,7 +31,7 @@ fn count_users(conn: &Connection) -> i64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let conn = Connection::open_in_memory()?;
+    let mut conn = Connection::open_in_memory()?;
     conn.execute_batch_raw(bsql_examples::SQLITE_SCHEMA)?;
 
     // ── A transaction that COMMITS: both inserts land atomically ─────────────

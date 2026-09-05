@@ -542,3 +542,26 @@ fn pipeline_guard_no_false_positive_on_varchar_bpchar_or_user_type() {
         );
     }
 }
+
+#[test]
+fn pipeline_recovery_sync_staged_tracking() {
+    let mut engine = active();
+    assert!(!engine.is_pipelining());
+    assert!(!engine.is_pipelining_without_sync());
+
+    engine.begin_pipeline();
+    assert!(engine.is_pipelining());
+    assert!(engine.is_pipelining_without_sync(), "pipeline started without Sync staged");
+
+    engine.mark_pipeline_sync_staged();
+    assert!(engine.is_pipelining());
+    assert!(!engine.is_pipelining_without_sync(), "Sync was staged; no extra Sync needed");
+
+    // Driving through RFQ returns to clean idle and clears both flags
+    let inbound = ready_idle();
+    let mut transport = ScriptReader { inbound };
+    let (boundary, _, _, _) = drive(&mut engine, &mut transport);
+    assert_eq!(boundary, Boundary::Idle);
+    assert!(!engine.is_pipelining());
+    assert!(!engine.is_pipelining_without_sync());
+}

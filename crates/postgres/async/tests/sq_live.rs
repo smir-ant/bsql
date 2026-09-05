@@ -2794,3 +2794,43 @@ async fn prepared_statement_used_on_a_foreign_connection_is_rejected() {
     a.close().await.expect("close A");
     b.close().await.expect("close B");
 }
+
+/// WITNESS: an async transaction dropped after issuing its first verb triggers
+/// automatic ROLLBACK before the connection issues any new commands, leaving
+/// the session in clean Idle state.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn transaction_cancellation_rolls_back_automatically() {
+    let cfg = ConnectConfig::new("localhost", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&cfg).await.expect("connect");
+
+    c.execute_raw("CREATE TEMP TABLE t_tx_cancel(id int PRIMARY KEY, v text)")
+        .await
+        .expect("create table");
+
+    // Start a transaction, insert a row, then drop the transaction future before commit:
+    {
+        let fut = c.transaction(async |tx| {
+            tx.execute_raw("INSERT INTO t_tx_cancel VALUES (1, 'cancelled')")
+                .await?;
+            core::future::pending::<Result<(), DriverError>>().await
+        });
+        // We poll it with a short timeout to ensure the first query runs and then drops:
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), fut).await;
+    }
+
+    // Dropped transaction must have marked tx_needs_rollback:
+    assert!(c.tx_needs_rollback(), "dropped active transaction must flag tx_needs_rollback");
+
+    // Issuing a new command on the same connection automatically rolls back:
+    let rows = c
+        .query_raw("SELECT count(*) FROM t_tx_cancel")
+        .await
+        .expect("query after dropped tx must succeed via auto-rollback");
+    assert_eq!(rows.get(0).expect("row").get_i64(0), Ok(Some(0)), "inserted row was rolled back");
+    assert_eq!(c.tx_status(), Some(bsql_postgres_async::TxStatus::Idle));
+    assert!(!c.tx_needs_rollback());
+
+    c.close().await.expect("close");
+}
+

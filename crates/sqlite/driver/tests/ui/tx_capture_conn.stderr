@@ -1,0 +1,14 @@
+error[E0502]: cannot borrow `conn` as mutable because it is also borrowed as immutable
+  --> tests/ui/tx_capture_conn.rs:9:13
+   |
+ 9 |       let _ = conn.transaction(|_tx| {
+   |               ^    ----------- ----- immutable borrow occurs here
+   |               |    |
+   |  _____________|    immutable borrow later used by call
+   | |
+10 | |         // Attempting to use conn directly inside closure while conn is mutably borrowed:
+11 | |         let _ = conn.execute_raw("SELECT 1");
+   | |                 ---- first borrow occurs due to use of `conn` in closure
+12 | |         Ok(())
+13 | |     });
+   | |______^ mutable borrow occurs here

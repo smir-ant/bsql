@@ -140,11 +140,16 @@ impl Redial {
     /// `Connection` so `cancel_token()` can mint tokens on demand.
     #[doc(hidden)]
     #[must_use]
-    pub fn from_config(config: &ConnectConfig) -> Self {
+    pub fn from_config(config: &ConnectConfig, encrypted: bool) -> Self {
+        let mode = if encrypted {
+            Some(SslMode::Require)
+        } else {
+            config.ssl_mode_raw()
+        };
         Self {
             host: Arc::from(config.host.as_str()),
             port: config.port,
-            ssl_mode: config.ssl_mode_raw(),
+            ssl_mode: mode,
             ca_roots: config.ca_roots_arc(),
             connect_timeout_secs: config.connect_timeout_secs,
         }
@@ -218,7 +223,7 @@ mod tests {
         // the same SSL-refused error classification.
         let config = ConnectConfig::new("db.example.com", "alice").port(6432);
         assert!(!config.ssl_mode_is_explicit());
-        let redial = Redial::from_config(&config);
+        let redial = Redial::from_config(&config, false);
         let rebuilt = redial.rebuild_config();
         assert_eq!(rebuilt.host, "db.example.com");
         assert_eq!(rebuilt.port, 6432);
@@ -234,13 +239,22 @@ mod tests {
     #[test]
     fn rebuild_preserves_an_explicit_ssl_mode() {
         let config = ConnectConfig::new("db.example.com", "alice").ssl_mode(SslMode::Require);
-        let redial = Redial::from_config(&config);
+        let redial = Redial::from_config(&config, false);
         let rebuilt = redial.rebuild_config();
         assert!(rebuilt.ssl_mode_is_explicit());
         assert_eq!(
             rebuilt.resolve_ssl_mode(&crate::resolve_endpoint(&rebuilt.host, rebuilt.port)),
             SslMode::Require,
         );
+    }
+
+    #[test]
+    fn rebuild_enforces_require_when_parent_was_encrypted() {
+        let config = ConnectConfig::new("localhost", "alice").ssl_mode(SslMode::Prefer);
+        let redial = Redial::from_config(&config, true);
+        let rebuilt = redial.rebuild_config();
+        assert!(rebuilt.ssl_mode_is_explicit());
+        assert_eq!(rebuilt.ssl_mode_raw(), Some(SslMode::Require));
     }
 
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}

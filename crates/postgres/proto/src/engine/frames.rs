@@ -50,7 +50,7 @@ pub(super) const COPY_DONE_WIRE: [u8; 5] = [crate::wire::TAG_COPY_DONE.byte(), 0
 /// SQL plus framing overflows the bounded [`WriteBuf`] — a classified
 /// frame-too-long, never a silent truncation.
 #[inline]
-pub(crate) fn build_simple_query(wb: &mut WriteBuf, sql: &[u8]) -> Result<(), WriteBufFull> {
+pub(crate) fn build_simple_query<S: FrameSink>(wb: &mut S, sql: &[u8]) -> Result<(), WriteBufFull> {
     wb.push_u8(TAG_QUERY.byte())?;
     wb.with_length_prefix(|w| {
         w.push_bytes(sql)?;
@@ -65,7 +65,10 @@ pub(crate) fn build_simple_query(wb: &mut WriteBuf, sql: &[u8]) -> Result<(), Wr
 /// [`WriteBuf`] — the same header-in-scratch / body-on-send-buffer split the
 /// `CopyData` path uses. `Err` only if `4 + sql_len + 1` overflows `u32`.
 #[inline]
-pub(crate) fn build_simple_query_header(wb: &mut WriteBuf, sql_len: u32) -> Result<(), WriteBufFull> {
+pub(crate) fn build_simple_query_header<S: FrameSink>(
+    wb: &mut S,
+    sql_len: u32,
+) -> Result<(), WriteBufFull> {
     wb.push_u8(TAG_QUERY.byte())?;
     // Self-inclusive length: 4 (the length field) + sql_len + 1 (the NUL).
     let len = sql_len.checked_add(5).ok_or(WriteBufFull)?;
@@ -281,24 +284,40 @@ pub(crate) fn build_copy_data_header(
 /// (> 2 GiB — architecturally dead) — the crate's classified
 /// [`WriteBufFull`](crate::write_buf::WriteBufFull), never a panic or a silent
 /// truncation.
+/// Write one PGCOPY BINARY row body: `int16 field-count | per-field {len i32, bytes}`.
+/// Unlike [`build_copy_binary_row`], this does NOT wrap the row in an individual
+/// `'d'` CopyData frame, enabling multiple rows to be aggregated into a single
+/// 64 KiB `CopyData` frame for maximum throughput.
+#[inline]
+pub(crate) fn build_copy_binary_row_body<P: ParamsWriter, S: FrameSink>(
+    wb: &mut S,
+    row: &P,
+) -> Result<(), WriteBufFull> {
+    let field_count = i16::try_from(P::COUNT).map_err(|_| WriteBufFull)?;
+    wb.push_i16_be(field_count)?;
+    row.write_params(wb)
+}
+
+/// `'d'` CopyData frame carrying one PGCOPY BINARY row: `tag | len | int16
+/// field-count | per-field {len i32, bytes}` (a field `len` of `-1` is a SQL
+/// NULL, no body). `len` is self-inclusive (PG convention). The per-field block
+/// is byte-identical to a Bind parameter block — it reuses the SAME
+/// [`ParamsWriter::write_params`] leaves — so the binary-COPY field encoding
+/// cannot drift from the `query!` parameter encoding. Streams DIRECTLY onto the
+/// growable send buffer (no per-row scratch), so a bulk load copies each field
+/// once.
+///
+/// `Err` only if the encoded row body exceeds the `u32` / `i32` wire length field
+/// (> 2 GiB — architecturally dead) — the crate's classified
+/// [`WriteBufFull`](crate::write_buf::WriteBufFull), never a panic or a silent
+/// truncation.
 #[inline]
 pub(crate) fn build_copy_binary_row<P: ParamsWriter, S: FrameSink>(
     wb: &mut S,
     row: &P,
 ) -> Result<(), WriteBufFull> {
-    // The PGCOPY row field-count is a signed int16; `ParamsWriter` arity is
-    // 0..=16, so this conversion never truncates. The classified `WriteBufFull`
-    // covers the architecturally-dead overflow rather than an `as` cast (the
-    // crate forbids `as_conversions`).
-    let field_count = i16::try_from(P::COUNT).map_err(|_| WriteBufFull)?;
     wb.push_u8(crate::wire::TAG_COPY_DATA.byte())?;
-    // Self-inclusive length over the row body: int16 field-count + the parameter
-    // block. The closure's tail IS `write_params`, so its `Result` propagates
-    // directly (no error-capture dance).
-    wb.with_length_prefix(|w| {
-        w.push_i16_be(field_count)?;
-        row.write_params(w)
-    })
+    wb.with_length_prefix(|w| build_copy_binary_row_body(w, row))
 }
 
 /// `'f'` CopyFail frame: `tag | len | reason | NUL`. Aborts an in-progress
