@@ -48,16 +48,6 @@ jobs:
       - name: Show toolchain
         run: rustup show
 
-      # rust-src makes rustc render the FULL const-eval panic diagnostic (the
-      # `$RUST/core/src/panic.rs` source snippet + caret) that a couple of trybuild
-      # `compile_fail` goldens capture. The pinned toolchain is `profile = minimal`
-      # (no rust-src), and without it the compiler falls back to a terser
-      # `= note: the failure occurred here`, so those goldens (pinned on a dev host
-      # that has rust-src) would spuriously mismatch. Installing it makes CI's
-      # diagnostic rendering identical to the dev host — the goldens stay byte-exact.
-      - name: Add rust-src (match dev-host const-eval diagnostics)
-        run: rustup component add rust-src
-
       - name: Cache cargo + target
         uses: actions/cache@v4
         with:
