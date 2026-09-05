@@ -54,7 +54,7 @@ under the tables).
 ### PostgreSQL — latency (µs, lower better)
 
 ```text
-Point Read (SELECT by-PK, 1 connection; █ = full unit, ▌ = half unit):
+Point Read (SELECT by-PK, 1 connection):
 bsql (sync)      [████                    ] 24.6 µs   (1.0x)  1.69 MB
 bsql (async)     [████▌                   ] 26.2 µs   (1.1x)  1.80 MB
 C / libpq        [████                    ] 25.5 µs   (1.0x) 13.25 MB
@@ -77,7 +77,7 @@ Go / pgx         [█████████               ] 52.1 µs   (2.1x) 
 Bytes from [`results/pg_rss.log`](results/pg_rss.log) ÷ 10⁶ (decimal MB).
 ```text
 bsql (sync)      [██                      ]  1.69 MB  (1.0x)
-bsql (async)     [██░                     ]  1.80 MB  (1.1x)
+bsql (async)     [██▌                     ]  1.80 MB  (1.1x)
 tokio-postgres   [████████                ]  6.50 MB  (3.9x)
 sqlx             [████████                ]  6.73 MB  (4.0x)
 diesel           [█████████               ]  7.01 MB  (4.2x)
@@ -129,7 +129,7 @@ not here.
 ### SQLite — latency (µs, median of 3, lower better)
 
 ```text
-Point Read (SELECT by-PK prepared; █ = full unit, ▌ = half unit):
+Point Read (SELECT by-PK prepared):
 C / sqlite3      [██                      ] 1.51 µs  (1.0x)   3.83 MB
 bsql             [██                      ] 1.58 µs  (1.0x)   3.86 MB
 diesel           [██▌                     ] 1.87 µs  (1.2x)   4.08 MB
@@ -154,8 +154,8 @@ Bytes from separate process per client (`getrusage`).
 ```text
 C / sqlite3      [██                      ] 3.83 MB  (1.0x)
 bsql             [██                      ] 3.86 MB  (1.0x — virtual tie)
-diesel           [██░                     ] 4.08 MB  (1.06x)
-sqlx             [██░                     ] 4.59 MB  (1.2x)
+diesel           [██                      ] 4.08 MB  (1.06x)
+sqlx             [██▌                     ] 4.59 MB  (1.2x)
 Go / mattn       [████████                ] 16.94 MB (4.4x)
 ```
 
