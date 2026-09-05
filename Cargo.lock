@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-build"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "rusqlite",
  "sha2",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-common"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 
 [[package]]
 name = "bsql-corpus"
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-async"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-core"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "bsql-common",
  "bsql-devgates",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-proto"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-sync"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-query-macros"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "bsql-build",
  "proc-macro2",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-sqlite"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "bsql-common",
  "bsql-devgates",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-testkit"
-version = "1.0.0-alpha.4"
+version = "1.0.0-alpha.5"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",

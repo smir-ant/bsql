@@ -1,6 +1,6 @@
 # bsql — multi-backend SQL toolkit in Rust
 
-Workspace version **1.0.0-alpha.4** (tag `v1.0.0-alpha.4` = HEAD, published to
+Workspace version **1.0.0-alpha.5** (tag `v1.0.0-alpha.5` = HEAD, published to
 crates.io). The API is alpha: breaking changes are allowed.
 
 A compile-checked `query!` macro, PostgreSQL async + sync drivers, and an

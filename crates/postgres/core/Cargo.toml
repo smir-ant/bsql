@@ -92,7 +92,7 @@ md5-auth = ["bsql-postgres-proto/md5-auth"]
 # DROP proto's default-on `scram` feature; the SCRAM crypto is re-enabled through
 # the `scram` feature above. Without this, proto's default would force SCRAM on
 # for the whole graph, defeating the drop.
-bsql-postgres-proto = { version = "1.0.0-alpha.4", path = "../proto", default-features = false }
+bsql-postgres-proto = { version = "1.0.0-alpha.5", path = "../proto", default-features = false }
 # `bsql-common` — the ZERO-DEPENDENCY leaf crate hosting the migration PURE
 # logic (checksum / ordering / drift authority + source loader) and — behind its
 # `n1` feature, forwarded from this crate's `n1-detect` — the N+1 detector. ONE
@@ -103,7 +103,7 @@ bsql-postgres-proto = { version = "1.0.0-alpha.4", path = "../proto", default-fe
 # poll + backoff (PostgreSQL-only I/O) and this crate's own `MigrationError`
 # (with its PG-only `LockTimeout`) stay here, bridged through the shared
 # `migrate::plan()` seam + a local `From<migrate::Drift>`.
-bsql-common = { version = "1.0.0-alpha.4", path = "../../common" }
+bsql-common = { version = "1.0.0-alpha.5", path = "../../common" }
 # `stringprep` — OPTIONAL, behind the default-on `scram` feature. RFC 4013
 # SASLprep of the SCRAM password (RFC 5802 mandates it); applied in
 # `scram_prep::saslprep_password` at credential construction so the no_std

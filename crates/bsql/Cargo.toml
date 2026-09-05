@@ -124,13 +124,13 @@ test-harness = [
 # any consumer through it) can drop core's default-on `webpki-roots` (the baked
 # Mozilla CA blob). The umbrella re-exposes it via its own default-on
 # `webpki-roots` feature above, which forwards to the enabled driver(s).
-bsql-postgres-async = { version = "1.0.0-alpha.4", path = "../postgres/async", optional = true, default-features = false }
-bsql-postgres-sync = { version = "1.0.0-alpha.4", path = "../postgres/sync", optional = true, default-features = false }
-bsql-sqlite = { version = "1.0.0-alpha.4", path = "../sqlite/driver", optional = true }
+bsql-postgres-async = { version = "1.0.0-alpha.5", path = "../postgres/async", optional = true, default-features = false }
+bsql-postgres-sync = { version = "1.0.0-alpha.5", path = "../postgres/sync", optional = true, default-features = false }
+bsql-sqlite = { version = "1.0.0-alpha.5", path = "../sqlite/driver", optional = true }
 
 # Behind `testkit` only — the in-memory fake PostgreSQL. It re-enables the async
 # driver's + core's `testkit` feature, so it is inert unless a consumer opts in.
-bsql-testkit = { version = "1.0.0-alpha.4", path = "../testkit", optional = true }
+bsql-testkit = { version = "1.0.0-alpha.5", path = "../testkit", optional = true }
 
 # Behind `macros` only. `bsql-query-macros` is a proc-macro (host-only,
 # compile-time); `bsql-postgres-proto` (sans-IO decode primitives the macro's
@@ -138,14 +138,14 @@ bsql-testkit = { version = "1.0.0-alpha.4", path = "../testkit", optional = true
 # query-API runtime surface. All three are already resolved workspace members
 # (proto/core via the drivers, query-macros via the fixtures), so `deps_pin`'s
 # package SET is unchanged; these are the umbrella re-export edges.
-bsql-query-macros = { version = "1.0.0-alpha.4", path = "../query-macros", optional = true }
-bsql-postgres-proto = { version = "1.0.0-alpha.4", path = "../postgres/proto", optional = true }
+bsql-query-macros = { version = "1.0.0-alpha.5", path = "../query-macros", optional = true }
+bsql-postgres-proto = { version = "1.0.0-alpha.5", path = "../postgres/proto", optional = true }
 # `default-features = false`: the `macros`/`test-harness` surface this pulls (the
 # `sql_ident` validator, `Rows`/`RowsBuilder`) needs no TLS roots, and forcing
 # core's default-on `webpki-roots` here would defeat the umbrella opt-out (Cargo
 # unifies features across edges, so a default-on core edge would re-enable the
 # baked blob even when the driver edges dropped it).
-bsql-postgres-core = { version = "1.0.0-alpha.4", path = "../postgres/core", optional = true, default-features = false }
+bsql-postgres-core = { version = "1.0.0-alpha.5", path = "../postgres/core", optional = true, default-features = false }
 
 # Behind `test-harness` only — the per-test runtime the `#[bsql::test]` harness
 # builds. `rt` runs the current-thread runtime; `net` + `time` enable the I/O and

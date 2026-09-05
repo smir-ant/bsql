@@ -6,13 +6,8 @@ Write real SQL. It is checked at `cargo build` against the schema your migration
 files define — table names, column names, types, nullability. **If it compiles,
 the query is correct.** No DSL, no method chains, no runtime "column not found".
 
-> **1.0.0-alpha.4** — stable in shape, early in life; expect a few more alpha
-> iterations before a full 1.0. On crates.io as a **pre-release**: pin
-> `bsql = "1.0.0-alpha.4"` (a bare `cargo add bsql` resolves the older stable
-> `0.27` — a different, unrelated library). Built with
-> Claude and Gemini in adversarial dual-LLM pair engineering (collaborating across
-> architecture synthesis, red-team auditing, competitive benchmarking, and
-> zero-overhead implementation).
+> **1.0.0-alpha.5** — stable in shape, early in life; expect a few more alpha
+> iterations before a full 1.0.
 
 ```rust
 // migrations/0001_init.sql →  CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL);
@@ -157,10 +152,10 @@ In microbenchmarks (single point reads on loopback TCP), modern OS kernel TCP st
 ```toml
 # Cargo.toml  (alpha is a pre-release, so pin the exact version)
 [dependencies]
-bsql = { version = "1.0.0-alpha.4", features = ["macros", "postgres-async"] }
+bsql = { version = "1.0.0-alpha.5", features = ["macros", "postgres-async"] }
 
 [build-dependencies]
-bsql-build = "1.0.0-alpha.4"
+bsql-build = "1.0.0-alpha.5"
 ```
 
 ```rust
