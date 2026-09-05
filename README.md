@@ -69,26 +69,26 @@ let user = conn.query_one::<UserById>((42_i32,)).await?;
 
 ### 1. PostgreSQL — Latency & Memory Footprint
 
-Point read latency (`SELECT by-PK`, 1 connection, lower is better):
+Point read latency (`SELECT by-PK`, 1 connection, lower is better; `█` = full unit, `▌` = half unit):
 
 ```text
 bsql (sync)      [████                    ] 24.6 µs   (1.0x)  1.69 MB
-bsql (async)     [████░                   ] 26.2 µs   (1.1x)  1.80 MB
+bsql (async)     [████▌                   ] 26.2 µs   (1.1x)  1.80 MB
 C / libpq        [████                    ] 25.5 µs   (1.0x) 13.25 MB
-sqlx             [█████                   ] 27.9 µs   (1.1x)  6.73 MB
-tokio-postgres   [███████                 ] 39.8 µs   (1.6x)  6.50 MB
+sqlx             [████▌                   ] 27.9 µs   (1.1x)  6.73 MB
+tokio-postgres   [██████▌                 ] 39.8 µs   (1.6x)  6.50 MB
 diesel           [███████                 ] 41.3 µs   (1.7x)  7.01 MB
 Go / pgx         [█████████               ] 52.1 µs   (2.1x) 16.81 MB
 ```
 
 ### 2. SQLite — Pure C-Level Speed with Type Safety
 
-Point read latency (`SELECT by-PK prepared`, lower is better):
+Point read latency (`SELECT by-PK prepared`, lower is better; `█` = full unit, `▌` = half unit):
 
 ```text
 C / sqlite3      [██                      ] 1.51 µs  (1.0x)   3.83 MB
 bsql             [██                      ] 1.58 µs  (1.0x)   3.86 MB
-diesel           [██░                     ] 1.87 µs  (1.2x)   4.08 MB
+diesel           [██▌                     ] 1.87 µs  (1.2x)   4.08 MB
 Go / mattn       [████                    ] 3.25 µs  (2.2x)  16.94 MB
 sqlx             [████████                ] 6.16 µs  (4.1x)   4.59 MB
 ```
