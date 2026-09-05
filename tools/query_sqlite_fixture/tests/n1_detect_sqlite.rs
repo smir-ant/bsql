@@ -206,7 +206,7 @@ fn manual_rollback_resets_the_window_like_pg() {
 ///    window but keeps the accumulated reports).
 #[test]
 fn n_plus_one_through_the_transaction_guard_is_flagged_at_the_consumer_line() {
-    let conn = seed();
+    let mut conn = seed();
     let mut call_line = 0u32;
     conn.transaction(|tx| {
         for _ in 0..LOOP {

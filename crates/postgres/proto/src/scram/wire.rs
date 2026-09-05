@@ -763,7 +763,7 @@ pub(crate) fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError>
         // silent fallback `SecretDigest::new([0; 32])` on impossible
         // None branches would rely on downstream `ct_eq` rejecting
         // the all-zero signature — fail-closed by accident (tier-4
-        // per CREDO §7 ось 12).
+        // per CREDO §7 axis 12).
         let sig_bytes: [u8; 32] = <[u8; 32]>::try_from(decoded.as_slice())
             .map_err(|_| ScramError::MalformedServerFinal)?;
         Ok(SecretDigest::new(sig_bytes))

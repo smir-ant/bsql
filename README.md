@@ -10,8 +10,9 @@ the query is correct.** No DSL, no method chains, no runtime "column not found".
 > iterations before a full 1.0. On crates.io as a **pre-release**: pin
 > `bsql = "1.0.0-alpha.4"` (a bare `cargo add bsql` resolves the older stable
 > `0.27` — a different, unrelated library). Built with
-> [Claude Code](https://claude.com/claude-code) (design first, review second,
-> implementation third).
+> Claude and Gemini in adversarial dual-LLM pair engineering (collaborating across
+> architecture synthesis, red-team auditing, competitive benchmarking, and
+> zero-overhead implementation).
 
 ```rust
 // migrations/0001_init.sql →  CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL);
@@ -69,7 +70,7 @@ let user = conn.query_one::<UserById>((42_i32,)).await?;
 
 ### 1. PostgreSQL — Latency & Memory Footprint
 
-Point read latency (`SELECT by-PK`, 1 connection, lower is better; `█` = full unit, `▌` = half unit):
+Point read latency (`SELECT by-PK`, 1 connection, lower is better):
 
 ```text
 bsql (sync)      [████                    ] 24.6 µs   (1.0x)  1.69 MB
@@ -83,7 +84,7 @@ Go / pgx         [█████████               ] 52.1 µs   (2.1x) 
 
 ### 2. SQLite — Pure C-Level Speed with Type Safety
 
-Point read latency (`SELECT by-PK prepared`, lower is better; `█` = full unit, `▌` = half unit):
+Point read latency (`SELECT by-PK prepared`, lower is better):
 
 ```text
 C / sqlite3      [██                      ] 1.51 µs  (1.0x)   3.83 MB
@@ -98,7 +99,7 @@ sqlx             [████████                ] 6.16 µs  (4.1x)   4
 - Peak RSS is a virtual tie with raw C (**3.86 MB** vs **3.83 MB**).
 
 <details>
-<summary><b>Where the Real Multipliers Are ("В разы", not fractions of a percent)</b></summary>
+<summary><b>Where the Real Multipliers Are (Orders of Magnitude, Not Fractions of a Percent)</b></summary>
 
 In microbenchmarks (single point reads on loopback TCP), modern OS kernel TCP stacks and DB query planning consume ~85–90% of the ~25 µs round trip. Driver micro-optimizations shave ~200–300 ns (~1–2% on loopback, invisible over a 1 ms network ping). Anyone promising 10× on a single SELECT is selling snake oil.
 
@@ -493,11 +494,12 @@ normal clone stays lean.
 
 ## About
 
-Built with [Claude Code](https://claude.com/claude-code). Design first,
-architectural review second, implementation third — every slice reviewed
-adversarially before it landed.
+Built with Claude and Gemini in adversarial dual-LLM pair engineering. Both
+systems collaborated continuously across architectural synthesis, red-team
+chaos auditing, adversarial judging, and zero-overhead implementation — every
+slice challenged and verified before it landed.
 
-~2,400 tests across the workspace — unit, integration, compile-fail (`trybuild`),
+2,640+ tests across the workspace — unit, integration, compile-fail (`trybuild`),
 live-database, dependency-free fuzz, and machine-checked codegen gates. Not just
 tests that the code works, but tests that *broken* code is rejected at compile
 time. Hardened by a real-load fault-injection pass (TLS byte-fragmentation,
