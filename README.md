@@ -21,10 +21,10 @@ don't have to trust the tables — [reproduce them](#reproduce-it-yourself).
 
 - **Device:** MacBook Pro 14″ (Apple **M1 Pro**), macOS **26.0.1**,
   `aarch64-apple-darwin`.
-- **Servers:** PostgreSQL **15.14** (Homebrew), loopback TCP, trust auth; SQLite via
+- **Servers:** PostgreSQL **17.9** (Homebrew), loopback TCP, trust auth; SQLite via
   the **bundled amalgamation** (one file DB), one connection per client.
-- **Toolchains:** rustc **1.97.0** (stable — this bench is an independent project
-  built on current stable), Go **1.26.5**, Apple clang.
+- **Toolchains:** rustc **1.96.0** (pinned via `rust-toolchain.toml`), Go **1.26.5**,
+  Apple clang **17.0.0**.
 - **Max-performance build flags** (every client, so nobody is handicapped):
 
   | language | flags |
@@ -33,9 +33,9 @@ don't have to trust the tables — [reproduce them](#reproduce-it-yourself).
   | **Rust** (bsql + competitors) | `opt-level=3`, `lto="fat"`, `codegen-units=1`, `RUSTFLAGS="-C target-cpu=native"` |
   | **Go** | default optimized `go build` (arm64 has no `-march` knob; cgo on for the SQLite driver) |
 
-- **Client libraries:** bsql **1.0.0-alpha**, tokio-postgres **0.7.18**, sqlx **0.8.6**,
+- **Client libraries:** bsql **1.0.0-alpha.5**, tokio-postgres **0.7.18**, sqlx **0.8.6**,
   diesel / diesel-async **2.2 / 0.6**, jackc/pgx **v5.10**, mattn/go-sqlite3 **1.14**,
-  libpq **14**.
+  libpq **17.9**.
 - **SQLite engine versions** (each client prints its own at runtime): bsql, C and
   diesel link SQLite **3.50.2** (byte-identical engines — the C↔bsql delta is *pure
   wrapper overhead*); sqlx links 3.46.0, Go/mattn 3.46.1.
