@@ -130,33 +130,42 @@ not here.
 
 ```text
 Point Read (SELECT by-PK prepared):
-C / sqlite3      [██                      ] 1.5 µs  (1.0x)  3.95 MB
-bsql             [██                      ] 1.6 µs  (1.1x)  4.01 MB
-diesel           [██░                     ] 1.9 µs  (1.3x)  4.26 MB
-Go / mattn       [████                    ] 3.3 µs  (2.2x) 17.45 MB
-sqlx             [████████                ] 6.3 µs  (4.2x)  4.88 MB
+C / sqlite3      [██                      ] 1.51 µs  (1.0x)   3.83 MB
+bsql             [██                      ] 1.58 µs  (1.0x)   3.86 MB
+diesel           [██░                     ] 1.87 µs  (1.2x)   4.08 MB
+Go / mattn       [████                    ] 3.25 µs  (2.2x)  16.94 MB
+sqlx             [████████                ] 6.16 µs  (4.1x)   4.59 MB
 ```
 
 | scenario | bsql | C/sqlite3 | diesel | Go/mattn | sqlx |
 |---|---|---|---|---|---|
-| by-PK (prepared) | 1.6 <kbd>x1.1</kbd> | **1.5** <kbd>x1</kbd> | 1.9 <kbd>x1.3</kbd> | 3.3 <kbd>x2.2</kbd> | 6.3 <kbd>x4.2</kbd> |
-| 10 rows (prepared) | **4.8** <kbd>x1</kbd> | 6.0 <kbd>x1.3</kbd> | 10.0 <kbd>x2.1</kbd> | 10.0 <kbd>x2.1</kbd> | 13.9 <kbd>x2.9</kbd> |
-| 100 rows (prepared) | **13.9** <kbd>x1</kbd> | 14.6 <kbd>x1.1</kbd> | 30.0 <kbd>x2.2</kbd> | 71.7 <kbd>x5.2</kbd> | 110.4 <kbd>x7.9</kbd> |
-| 1000 rows (prepared) | 104.5 <kbd>x1.1</kbd> | **98.4** <kbd>x1</kbd> | 226.5 <kbd>x2.3</kbd> | 676.3 <kbd>x6.9</kbd> | 1.43 ms <kbd>x14.5</kbd> |
-| 10000 rows (prepared) | 1.04 ms <kbd>x1.1</kbd> | **948** <kbd>x1</kbd> | 2.22 ms <kbd>x2.3</kbd> | 6.88 ms <kbd>x7.3</kbd> | 14.51 ms <kbd>x15.3</kbd> |
-| INSERT single (prepared) | 20.0 <kbd>x1.0</kbd> | **19.4** <kbd>x1</kbd> | 21.4 <kbd>x1.1</kbd> | 23.9 <kbd>x1.2</kbd> | 28.4 <kbd>x1.5</kbd> |
-| INSERT batch (100) | **706 µs** <kbd>x1</kbd> | 1.09 ms <kbd>x1.5</kbd> | 1.19 ms <kbd>x1.7</kbd> | 1.21 ms <kbd>x1.7</kbd> | 1.68 ms <kbd>x2.4</kbd> |
-| Subquery (prepared) | 28.0 <kbd>x1.0</kbd> | **27.7** <kbd>x1</kbd> | 43.8 <kbd>x1.6</kbd> | 70.2 <kbd>x2.5</kbd> | 113.9 <kbd>x4.1</kbd> |
-| JOIN + aggregate | 35.40 ms <kbd>x1.0</kbd> | 35.29 ms <kbd>x1.0</kbd> | 35.27 ms <kbd>x1.0</kbd> | **34.71 ms** <kbd>x1</kbd> | 35.07 ms <kbd>x1.0</kbd> |
+| by-PK (prepared) | 1.58 <kbd>x1.0</kbd> | **1.51** <kbd>x1</kbd> | 1.87 <kbd>x1.2</kbd> | 3.25 <kbd>x2.2</kbd> | 6.16 <kbd>x4.1</kbd> |
+| 10 rows (prepared) | **4.69** <kbd>x1</kbd> | 5.87 <kbd>x1.3</kbd> | 9.91 <kbd>x2.1</kbd> | 9.96 <kbd>x2.1</kbd> | 14.05 <kbd>x3.0</kbd> |
+| 100 rows (prepared) | **13.48** <kbd>x1</kbd> | 14.41 <kbd>x1.1</kbd> | 29.70 <kbd>x2.2</kbd> | 71.81 <kbd>x5.3</kbd> | 112.37 <kbd>x8.3</kbd> |
+| 1000 rows (prepared) | 100.3 <kbd>x1.0</kbd> | **97.7** <kbd>x1</kbd> | 226.7 <kbd>x2.3</kbd> | 671.2 <kbd>x6.9</kbd> | 1.39 ms <kbd>x14.2</kbd> |
+| 10000 rows (prepared) | 1.02 ms <kbd>x1.1</kbd> | **943.9** <kbd>x1</kbd> | 2.19 ms <kbd>x2.3</kbd> | 6.82 ms <kbd>x7.2</kbd> | 14.19 ms <kbd>x15.0</kbd> |
+| INSERT single (prepared) | **18.43** <kbd>x1</kbd> | 18.65 <kbd>x1.0</kbd> | 21.01 <kbd>x1.1</kbd> | 23.65 <kbd>x1.3</kbd> | 27.89 <kbd>x1.5</kbd> |
+| INSERT batch (100) | **751 µs** <kbd>x1</kbd> | 909 µs <kbd>x1.2</kbd> | 1.07 ms <kbd>x1.4</kbd> | 1.07 ms <kbd>x1.4</kbd> | 1.54 ms <kbd>x2.1</kbd> |
+| Subquery (prepared) | 28.58 <kbd>x1.0</kbd> | **27.48** <kbd>x1</kbd> | 42.87 <kbd>x1.6</kbd> | 69.22 <kbd>x2.5</kbd> | 113.97 <kbd>x4.1</kbd> |
+| JOIN + aggregate | 34.64 ms <kbd>x1.0</kbd> | 34.77 ms <kbd>x1.0</kbd> | 34.36 ms <kbd>x1.0</kbd> | **34.12 ms** <kbd>x1</kbd> | 34.52 ms <kbd>x1.0</kbd> |
 
 ### SQLite — peak memory
+Bytes from separate process per client (`getrusage`).
+```text
+C / sqlite3      [██                      ] 3.83 MB  (1.0x)
+bsql             [██                      ] 3.86 MB  (1.0x — virtual tie)
+diesel           [██░                     ] 4.08 MB  (1.06x)
+sqlx             [██░                     ] 4.59 MB  (1.2x)
+Go / mattn       [████████                ] 16.94 MB (4.4x)
+```
+
 | client | peak RSS |
 |---|---|
-| C/sqlite3 | **3.95 MB** <kbd>x1</kbd> |
-| bsql | 4.01 MB <kbd>x1.0</kbd> |
-| diesel | 4.26 MB <kbd>x1.1</kbd> |
-| sqlx | 4.88 MB <kbd>x1.2</kbd> |
-| Go/mattn | 17.45 MB <kbd>x4.4</kbd> |
+| C/sqlite3 | **3.83 MB** <kbd>x1</kbd> |
+| bsql | 3.86 MB <kbd>x1.0</kbd> |
+| diesel | 4.08 MB <kbd>x1.06</kbd> |
+| sqlx | 4.59 MB <kbd>x1.2</kbd> |
+| Go/mattn | 16.94 MB <kbd>x4.4</kbd> |
 
 **Read it right.** bsql rides at the **engine-identical C reference** — it **ties or
 beats raw C** on all but two cells: *faster* than C on the 10-row, 100-row and batch-insert
