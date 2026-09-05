@@ -27,7 +27,7 @@ publish = false
 # backends). This is a `publish = false` STANDALONE workspace, so the added
 # `sqlite`/rusqlite subtree lands ONLY in this crate's own lock — never in the
 # shipped `deps_pin` / `runtime_graph_pin` gates.
-bsql = { git = "https://github.com/smir-ant/bsql", branch = "main", default-features = false, features = [
+bsql = { path = "../bsql/crates/bsql", default-features = false, features = [
     "postgres-async",
     "postgres-sync",
     "sqlite",
@@ -72,7 +72,7 @@ libsqlite3-sys = { version = "0.35", features = ["bundled"] }
 # BUILD-DEP ONLY — replays `migrations/` into the `query!` catalog (exactly the
 # placement a real consumer uses). `publish = false` standalone workspace, so
 # this build edge never enters the shipped `deps_pin` / `runtime_graph_pin`.
-bsql-build = { git = "https://github.com/smir-ant/bsql", branch = "main" }
+bsql-build = { path = "../bsql/crates/build" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

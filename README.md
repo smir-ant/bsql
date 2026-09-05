@@ -52,6 +52,18 @@ not two libraries — shown side by side so each is compared like-for-like (see 
 under the tables).
 
 ### PostgreSQL — latency (µs, lower better)
+
+```text
+Point Read (SELECT by-PK, 1 connection):
+bsql (sync)      [████                    ] 24.6 µs   (1.0x)  1.69 MB
+bsql (async)     [████░                   ] 26.2 µs   (1.1x)  1.80 MB
+C / libpq        [████                    ] 25.5 µs   (1.0x) 13.25 MB
+sqlx             [█████                   ] 27.9 µs   (1.1x)  6.73 MB
+tokio-postgres   [███████                 ] 39.8 µs   (1.6x)  6.50 MB
+diesel           [███████                 ] 41.3 µs   (1.7x)  7.01 MB
+Go / pgx         [█████████               ] 52.1 µs   (2.1x) 16.81 MB
+```
+
 | scenario | bsql (sync) | bsql | C/libpq | sqlx | tokio-pg | diesel | Go/pgx |
 |---|---|---|---|---|---|---|---|
 | SELECT by-PK (1) | **24.6** <kbd>x1</kbd> | 26.2 <kbd>x1.1</kbd> | 25.5 <kbd>x1.0</kbd> | 27.9 <kbd>x1.1</kbd> | 39.8 <kbd>x1.6</kbd> | 41.3 <kbd>x1.7</kbd> | 52.1 <kbd>x2.1</kbd> |
@@ -63,6 +75,16 @@ under the tables).
 
 ### PostgreSQL — peak memory
 Bytes from [`results/pg_rss.log`](results/pg_rss.log) ÷ 10⁶ (decimal MB).
+```text
+bsql (sync)      [██                      ]  1.69 MB  (1.0x)
+bsql (async)     [██░                     ]  1.80 MB  (1.1x)
+tokio-postgres   [████████                ]  6.50 MB  (3.9x)
+sqlx             [████████                ]  6.73 MB  (4.0x)
+diesel           [█████████               ]  7.01 MB  (4.2x)
+C / libpq        [████████████████        ] 13.25 MB  (7.9x)
+Go / pgx         [████████████████████    ] 16.81 MB (10.0x)
+```
+
 | client | peak RSS |
 |---|---|
 | bsql (sync) | **1.69 MB** <kbd>x1</kbd> |
@@ -105,6 +127,16 @@ its constant-memory property are measured under [Deeper benchmarks](#deeper-benc
 not here.
 
 ### SQLite — latency (µs, median of 3, lower better)
+
+```text
+Point Read (SELECT by-PK prepared):
+C / sqlite3      [██                      ] 1.5 µs  (1.0x)  3.95 MB
+bsql             [██                      ] 1.6 µs  (1.1x)  4.01 MB
+diesel           [██░                     ] 1.9 µs  (1.3x)  4.26 MB
+Go / mattn       [████                    ] 3.3 µs  (2.2x) 17.45 MB
+sqlx             [████████                ] 6.3 µs  (4.2x)  4.88 MB
+```
+
 | scenario | bsql | C/sqlite3 | diesel | Go/mattn | sqlx |
 |---|---|---|---|---|---|
 | by-PK (prepared) | 1.6 <kbd>x1.1</kbd> | **1.5** <kbd>x1</kbd> | 1.9 <kbd>x1.3</kbd> | 3.3 <kbd>x2.2</kbd> | 6.3 <kbd>x4.2</kbd> |
@@ -113,7 +145,7 @@ not here.
 | 1000 rows (prepared) | 104.5 <kbd>x1.1</kbd> | **98.4** <kbd>x1</kbd> | 226.5 <kbd>x2.3</kbd> | 676.3 <kbd>x6.9</kbd> | 1.43 ms <kbd>x14.5</kbd> |
 | 10000 rows (prepared) | 1.04 ms <kbd>x1.1</kbd> | **948** <kbd>x1</kbd> | 2.22 ms <kbd>x2.3</kbd> | 6.88 ms <kbd>x7.3</kbd> | 14.51 ms <kbd>x15.3</kbd> |
 | INSERT single (prepared) | 20.0 <kbd>x1.0</kbd> | **19.4** <kbd>x1</kbd> | 21.4 <kbd>x1.1</kbd> | 23.9 <kbd>x1.2</kbd> | 28.4 <kbd>x1.5</kbd> |
-| INSERT batch (100) | **980** <kbd>x1</kbd> | 1.09 ms <kbd>x1.1</kbd> | 1.19 ms <kbd>x1.2</kbd> | 1.21 ms <kbd>x1.2</kbd> | 1.68 ms <kbd>x1.7</kbd> |
+| INSERT batch (100) | **706 µs** <kbd>x1</kbd> | 1.09 ms <kbd>x1.5</kbd> | 1.19 ms <kbd>x1.7</kbd> | 1.21 ms <kbd>x1.7</kbd> | 1.68 ms <kbd>x2.4</kbd> |
 | Subquery (prepared) | 28.0 <kbd>x1.0</kbd> | **27.7** <kbd>x1</kbd> | 43.8 <kbd>x1.6</kbd> | 70.2 <kbd>x2.5</kbd> | 113.9 <kbd>x4.1</kbd> |
 | JOIN + aggregate | 35.40 ms <kbd>x1.0</kbd> | 35.29 ms <kbd>x1.0</kbd> | 35.27 ms <kbd>x1.0</kbd> | **34.71 ms** <kbd>x1</kbd> | 35.07 ms <kbd>x1.0</kbd> |
 
@@ -231,16 +263,25 @@ jitter under load.
 #### Throughput — sustained QPS (higher better)
 | workers | bsql-async | tokio-postgres | sqlx |
 |---|---|---|---|
-| 8 | **95.1k** <kbd>x1</kbd> | 90.3k <kbd>x1.05</kbd> | 92.2k <kbd>x1.03</kbd> |
-| 32 | 118.3k <kbd>x1.01</kbd> | **119.2k** <kbd>x1</kbd> | 119.0k <kbd>x1.00</kbd> |
-| 128 | 124.3k <kbd>x1.01</kbd> | 125.1k <kbd>x1.00</kbd> | **125.4k** <kbd>x1</kbd> |
+| 8 | **101.1k** <kbd>x1</kbd> | 93.7k <kbd>x1.08</kbd> | 97.1k <kbd>x1.04</kbd> |
+| 32 | 122.5k <kbd>x1.01</kbd> | **123.7k** <kbd>x1</kbd> | 122.6k <kbd>x1.01</kbd> |
+| 128 | **129.2k** <kbd>x1</kbd> | 127.7k <kbd>x1.01</kbd> | 129.2k <kbd>x1.00</kbd> |
 
 #### Tail latency — p99 µs (lower better)
 | workers | bsql-async | tokio-postgres | sqlx |
 |---|---|---|---|
-| 8 | **168** <kbd>x1</kbd> | 174 <kbd>x1.04</kbd> | 170 <kbd>x1.01</kbd> |
-| 32 | **410** <kbd>x1</kbd> | 466 <kbd>x1.14</kbd> | 486 <kbd>x1.19</kbd> |
-| 128 | **1632** <kbd>x1</kbd> | 1915 <kbd>x1.17</kbd> | 2037 <kbd>x1.25</kbd> |
+| 8 | **146.5** <kbd>x1</kbd> | 166.7 <kbd>x1.14</kbd> | 153.6 <kbd>x1.05</kbd> |
+| 32 | **401.1** <kbd>x1</kbd> | 413.1 <kbd>x1.03</kbd> | 410.6 <kbd>x1.02</kbd> |
+| 128 | **1587.1** <kbd>x1</kbd> | 1828.3 <kbd>x1.15</kbd> | 1865.2 <kbd>x1.18</kbd> |
+
+#### Extreme tail latency — p99.9 µs (lower better)
+| workers | bsql-async | tokio-postgres | sqlx |
+|---|---|---|---|
+| 8 | **181.8** <kbd>x1</kbd> | 307.8 <kbd>x1.69</kbd> | 191.9 <kbd>x1.06</kbd> |
+| 32 | 622.3 <kbd>x1.09</kbd> | 572.2 <kbd>x1.01</kbd> | **568.6** <kbd>x1</kbd> |
+| 128 | **2252.3** <kbd>x1</kbd> | 3326.8 <kbd>x1.48</kbd> | 2750.8 <kbd>x1.22</kbd> |
+
+---
 
 ### Constant-memory streaming — a property competitors structurally lack
 
@@ -252,11 +293,46 @@ grows **O(rows)**. Peak RSS reading a 1 M- and a 5 M-row result:
 #### Peak RSS (lower better)
 | rows | bsql `query_each` | tokio-postgres `query` | libpq `PQexec` |
 |---|---|---|---|
-| 1 M | **1.77 MB** <kbd>x1</kbd> | 197.8 MB <kbd>x112</kbd> | 105.5 MB <kbd>x60</kbd> |
-| 5 M | **1.77 MB** <kbd>x1</kbd> | 962.3 MB <kbd>x544</kbd> | 466.4 MB <kbd>x264</kbd> |
+| 1 M | **1.75 MB** <kbd>x1</kbd> | 188.8 MB <kbd>x108</kbd> | 100.9 MB <kbd>x58</kbd> |
+| 5 M | **1.75 MB** <kbd>x1</kbd> | 917.7 MB <kbd>x524</kbd> | 445.1 MB <kbd>x254</kbd> |
 
 **bsql's RSS is identical at 1 M and 5 M** — flat in row count — because it holds nothing:
-streaming 5 M rows made **9 total heap allocations** (164 bytes), i.e. **0.000002
-allocations/row**. The materialisers grow with the result — to ~962 MB (tokio-postgres) and
-~466 MB (libpq) at 5 M rows, **~540×** and **~260×** bsql's footprint. This is the report over
+streaming 5 M rows made **5 total heap allocations** (93 bytes total), i.e. **0.000001
+allocations/row**. The materialisers grow with the result — to ~918 MB (tokio-postgres) and
+~445 MB (libpq) at 5 M rows, **~524×** and **~254×** bsql's footprint. This is the report over
 tens of millions of rows that never grows memory — the thing `query_sql` / `PQexec` cannot do.
+
+---
+
+### Aggregated Binary `COPY IN` (~1,250× fewer wire frames)
+
+Traditional bulk loaders emit every single row in its own `CopyData` wire frame. For 100,000
+rows, that generates 100,000 5-byte headers and 100,000 socket write passes.
+
+bsql aggregates binary rows into adaptive **64 KiB chunks** directly inside `SendBuf`:
+- **Wire frames per 5,000 rows**: reduced from 5,000 to **4** frames ($\le 5$).
+- **Syscall reduction**: ~1,250× fewer write passes.
+- **Adaptive oversize handling**: rows exceeding 64 KiB flush seamlessly without truncating or buffer exhaustion.
+
+---
+
+### Noise Elimination & Deterministic Measurement Methodology
+
+Wall-clock time on modern hardware (especially multi-core laptop processors with thermal throttling
+and OS thread migration between Performance and Efficiency cores) exhibits statistical jitter.
+
+To eliminate noise, bsql enforces a **three-tier measurement hierarchy**:
+
+1. **Tier 1: Deterministic Zero-Jitter Invariants (0.0% noise)**:
+   - **Instruction count ceiling**: the hot path `next_event` is machine-checked at **761 instructions**
+     (0 panics, 0 unwind edges) via `cargo test --test engine_hotpath_codegen`.
+   - **Heap allocation counting**: a process-wide counting allocator strictly pins eager query
+     materialization to **14 allocations** and session reset to **11 allocations** via `materialize_alloc`.
+   - **Zero-allocation streaming slots**: `SlotsScratch` gives exactly **0 heap allocations** for $\le 16$
+     columns.
+2. **Tier 2: Statistical Latency Hardening**:
+   - 2,000-repetition warm-up to pre-heat branch predictor buffers, CPU caches, and PostgreSQL buffer pools.
+   - Reporting **median of 3 independent runs** (each taking the median of 7 warmed reps).
+3. **Tier 3: Macro-Scale Verification**:
+   - Testing multi-million row streams (1M and 5M rows) where architectural differences manifest as
+     orders of magnitude (524× RSS gap) rather than microsecond noise.

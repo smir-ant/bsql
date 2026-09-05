@@ -180,9 +180,9 @@ fn bench_insert_single(conn: &Connection) -> Result<(), SqliteError> {
 /// 100 DISCRETE INSERTs inside one transaction — the honest comparable to C's
 /// `bench_insert_batch`. Each `execute_params` re-prepares (see the module note),
 /// unlike C's one-prepared-statement reuse.
-fn bench_insert_batch(conn: &Connection) -> Result<(), SqliteError> {
+fn bench_insert_batch(conn: &mut Connection) -> Result<(), SqliteError> {
     let sql = "INSERT INTO bench_users (name, email, active, score) VALUES (?1, ?2, 1, 0.0)";
-    let run_batch = || -> Result<(), SqliteError> {
+    let mut run_batch = || -> Result<(), SqliteError> {
         conn.transaction(|tx| {
             for j in 0..100_i32 {
                 let name = format!("batch_{j}");
@@ -242,7 +242,7 @@ fn bench_subquery(conn: &Connection) -> Result<(), SqliteError> {
 fn run() -> Result<(), SqliteError> {
     let path = std::env::var("BENCH_SQLITE_PATH")
         .map_err(|_| SqliteError::Open("BENCH_SQLITE_PATH must be set".to_owned()))?;
-    let conn = Connection::open(&path)?;
+    let mut conn = Connection::open(&path)?;
     conn.execute_raw("PRAGMA synchronous=NORMAL")?;
     println!("=== rebuild bsql (bundled SQLite) Benchmarks ===");
     println!("path={path}\n");
@@ -261,7 +261,7 @@ fn run() -> Result<(), SqliteError> {
     bench_join_aggregate(&conn)?;
     bench_subquery(&conn)?;
     bench_insert_single(&conn)?;
-    bench_insert_batch(&conn)?;
+    bench_insert_batch(&mut conn)?;
     Ok(())
 }
 
