@@ -2,7 +2,7 @@
 name = "bsql-syncbackend-fixture"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Fixture consumer proving the write-once cross-backend `SyncBackend` surface end-to-end: ONE generic data layer (`load_users<B>`, the parameterized `user_by_id<B>`, a generic-transaction helper) written against `bsql::SyncBackend` compiles AND executes unchanged on the blocking PostgreSQL driver (live) and the embedded SQLite driver (in-process), plus the verbatim E0221 disproof that fixes `RunsOn`'s backend key. Never published."
 

@@ -2,7 +2,7 @@
 name = "bsql-query-bridge-fixture"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Fixture consumer exercising the external-type bridge end-to-end: a real build.rs calling bsql_build::Catalog::from_migrations(..).bridge(..).emit(), then query! decoding columns directly into consumer-chosen external types (a dep-free fixture-local stand-in AND the real uuid crate). Never published."
 

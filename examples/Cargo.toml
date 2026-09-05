@@ -2,7 +2,7 @@
 name = "bsql-examples"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Runnable, heavily-commented examples for bsql that double as a usage guide — one program per feature (basic CRUD, cross-backend, params vs raw, joins/aggregates, migrations, generated types, external-type bridges, N+1 detection, typed COPY, pipelining/batch, streaming, transactions, pooling, schema-per-test). Never published."
 

@@ -2,7 +2,7 @@
 name = "bsql-devgates"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Dev-only measurement and verification harness for the bsql workspace: a counting GlobalAlloc and a raw-memory probe. The sole sanctioned home for unsafe in the workspace — every SHIPPED crate is unsafe-free, with unsafe consolidated here behind a publish=false boundary."
 

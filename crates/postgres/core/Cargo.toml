@@ -2,7 +2,7 @@
 name = "bsql-postgres-core"
 version.workspace = true
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 description = "Shared types and Session for bsql PostgreSQL drivers (async + sync)"
 license = "MIT OR Apache-2.0"
 repository.workspace = true

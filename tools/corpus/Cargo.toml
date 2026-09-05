@@ -2,7 +2,7 @@
 name = "bsql-corpus"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Dev-only replay corpus: a Rust-native typed corpus of PostgreSQL wire transcripts replayed through an observable-I/O Adapter seam. Pins engine behaviour against committed ObservedRun goldens — the same corpus pins one engine now and any future re-implementation later, because the Adapter/ObservedRun types name ONLY observable values (client wire bytes + public outcomes), never an internal engine type."
 

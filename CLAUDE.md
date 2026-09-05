@@ -1435,9 +1435,8 @@ absent from the code) and from this cleanup pass:
   (`schema_per_test.rs`), and `bsql`'s `backend_error.rs`.
 - **`publish.yml`'s header comment** still claims there is no test CI, and points
   at a CLAUDE.md section that does not exist.
-- **`rust-version = "1.95"`** in the workspace manifest is one minor below the
-  pinned 1.96.0 toolchain and is never exercised — either raise it to 1.96 or
-  actually test the claim.
+- **`rust-version = "1.96"`** in the workspace manifest is aligned with the
+  pinned 1.96.0 toolchain (`rust-toolchain.toml`).
 - **Stale module doc in shipped code:** `crates/postgres/core/src/migrate.rs`
   still claims the run holds a session-level `pg_advisory_lock`, contradicting
   the non-blocking `pg_try_advisory_lock` poll the same file implements.

@@ -2162,8 +2162,9 @@ fn query_each_sql_break_stops_early_and_connection_is_reusable_sync() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     let mut seen = 0i64;
+    // Break after 100 of a 150-row stream (within the 128-frame drain budget).
     let stopped_at = c
-        .query_each_raw::<_, i64>("SELECT generate_series(1, 1000000) AS n", |row| {
+        .query_each_raw::<_, i64>("SELECT generate_series(1, 150) AS n", |row| {
             let _n = row.get_i64(0).expect("decode").expect("not NULL");
             seen += 1;
             if seen >= 100 {
@@ -2180,6 +2181,31 @@ fn query_each_sql_break_stops_early_and_connection_is_reusable_sync() {
     let after = c.query_one_raw("SELECT 7").expect("reuse after early break");
     assert_eq!(after.get_i32(0), Ok(Some(7)));
     c.close().expect("close");
+}
+
+/// Early break on a massive (1,000,000-row) stream must drop socket without hanging.
+#[test]
+#[ignore = "requires local PG"]
+fn query_each_sql_break_huge_stream_drops_socket_cleanly_sync() {
+    use core::ops::ControlFlow;
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    let mut seen = 0i64;
+    let stopped_at = c
+        .query_each_raw::<_, i64>("SELECT generate_series(1, 1000000) AS n", |row| {
+            let _n = row.get_i64(0).expect("decode").expect("not NULL");
+            seen += 1;
+            if seen >= 100 {
+                ControlFlow::Break(seen)
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .expect("break returns without error");
+
+    assert_eq!(stopped_at, Some(100));
+    assert_eq!(seen, 100);
+    assert!(!c.is_healthy());
 }
 
 /// WITNESS (blocking, oversize-row reassembly): `query_each_raw` streams multiple

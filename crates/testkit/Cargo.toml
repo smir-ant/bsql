@@ -2,7 +2,7 @@
 name = "bsql-testkit"
 version.workspace = true
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 description = "Deterministic in-memory fake PostgreSQL for testing bsql driver code with no network"
 license = "MIT OR Apache-2.0"
 repository.workspace = true

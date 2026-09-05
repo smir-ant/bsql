@@ -2,7 +2,7 @@
 name = "bsql-query-fixture"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Fixture consumer exercising the bsql compile-checked query chain end-to-end: a real build.rs calling bsql-build over a migrations/ directory, then query! typing SQL against the build-generated catalog. Hosts the freshness tests. Never published."
 

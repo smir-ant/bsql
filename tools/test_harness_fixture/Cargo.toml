@@ -2,7 +2,7 @@
 name = "bsql-test-harness-fixture"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Fixture consumer exercising the #[bsql::test] schema-per-test isolation attribute end-to-end over both drivers: two parallel isolated tests (async and sync), a mixed async+sync file, teardown-on-success, teardown-on-panic, and the loud unset-DSN error. Never published."
 

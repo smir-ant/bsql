@@ -2,7 +2,7 @@
 name = "bsql-query-sqlite-fixture"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Fixture consumer exercising the bsql SQLite build-time validation backend end-to-end: a real build.rs replays a SQLite-portable migrations/ directory into both the PostgreSQL catalog AND an in-memory→OUT_DIR SQLite template DB, then query! validates each query under a deny-all-but-readonly authorizer and cross-checks that real SQLite's prepare_v2 + decltype/table_info agree with the inference lattice. Hosts the SQLite conformance + scan-on-toggle trybuild gate. Never published."
 

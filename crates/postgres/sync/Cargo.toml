@@ -2,7 +2,7 @@
 name = "bsql-postgres-sync"
 version.workspace = true
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 description = "Sync PostgreSQL driver built on bsql-postgres-proto sans-IO state machine"
 license = "MIT OR Apache-2.0"
 repository.workspace = true
